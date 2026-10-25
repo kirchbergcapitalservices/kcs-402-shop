@@ -201,7 +201,22 @@ st = m.empty_state(); m.save_state(st, False); rc=m.main(); check("S22c ohne Gat
 try:
     g = FakeGH(); m.gh = g; st = m.empty_state(); m.close_with_notice(st, 70, "x", False); check("S23 ohne Vorgang abgewiesen", False)
 except Exception as e:
-    check("S23 ohne Vorgang abgewiesen, kein gh-Aufruf", "abschluss-ohne-vorgang" in str(e) and not g.calls)
+    check("S23 ohne Vorgang abgewiesen, kein gh-Aufruf, kein leerer Datensatz (K2 N1)", "abschluss-ohne-vorgang" in str(e) and not g.calls and "70" not in st["issues"])
+
+# S24 post-gestartet zählt als offenes Gate (Grok R4 P2)
+st = m.empty_state(); st["issues"]["80"]={"state":"eingeladen","login":"bob","tx":"0x"+"cc"*32,"abschluss":"post-gestartet"}; st["ephemer"]["81"]={"kommentar":"post-gestartet"}
+check("S24 post-gestartet in offene_gates", m.offene_gates(st)==[80,81], str(m.offene_gates(st)))
+
+# S25 Dedupe: gleiches Gate → ein Signal in zwei Läufen; geänderte Menge → neues Signal; Zeitpunkt im State
+g = FakeGH(); m.gh = g; st = m.empty_state(); st["issues"]["90"]={"state":"eingeladen","login":"bob","tx":"0x"+"dd"*32,"abschluss":"unklar"}; m.save_state(st, False)
+signale=[]; m.signal_mensch = lambda t: signale.append(t); sys.argv=["kcs402_check.py","--network","sepolia"]
+rc1=m.main(); rc2=m.main()
+check("S25 zwei Läufe, gleiches Gate: rc 2 beide, genau ein Signal", rc1==2 and rc2==2 and len(signale)==1, str(len(signale)))
+st=m.load_state(); check("S25b Signal im State persistiert", st["signal"]["gates"]==[90] and st["signal"]["at"]>0)
+st["ephemer"]["91"]={"kommentar":"unklar"}; m.save_state(st, False); rc3=m.main()
+check("S25c geänderte Menge → neues Signal", rc3==2 and len(signale)==2 and "#91" in signale[-1])
+st=m.load_state(); st["signal"]["at"]=0; m.save_state(st, False); m.main()
+check("S25d nach Ablauf der Frist erneut", len(signale)==3)
 
 # S11 Marker-Suche erkennt Pagination-Grenze als Fehler (nicht als 'kein Marker')
 g = FakeGH(); m.gh = g; g.comments[11] = [{"id": i, "body": "x"} for i in range(100*m.MAX_PAGES + 1)]

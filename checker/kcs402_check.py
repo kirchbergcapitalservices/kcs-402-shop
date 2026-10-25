@@ -193,6 +193,10 @@ def load_state():
         need(isinstance(inv, dict) and isinstance(inv.get("issue"), int), "invite")
         need(isinstance(inv.get("day"), str) and re.fullmatch(r"\d{4}-\d{2}-\d{2}", inv["day"]), "tag")
         st["invites"].append({"day": inv["day"], "issue": inv["issue"]})
+    sig = data.get("signal")
+    if isinstance(sig, dict) and isinstance(sig.get("gates"), list) and all(isinstance(n, int) for n in sig["gates"]) \
+            and isinstance(sig.get("at"), int) and sig["at"] >= 0:
+        st["signal"] = {"gates": sig["gates"], "at": sig["at"]}
     raw_e = data.get("ephemer", {})
     need(isinstance(raw_e, dict), "ephemer")
     for key, val in raw_e.items():
@@ -206,7 +210,7 @@ def save_state(st, dry):
     if dry:
         return
     clean = {"used_hashes": st["used_hashes"], "issues": st["issues"], "invites": st["invites"], "ephemer": st.get("ephemer", {}),
-             "last_ok": st.get("last_ok", 0)}
+             "last_ok": st.get("last_ok", 0), "signal": st.get("signal") or {}}
     payload = json.dumps(clean, indent=1, sort_keys=True) + "\n"
     tmp = STATE_DIR / ".state.json.tmp"
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_CLOEXEC, 0o600)
@@ -618,8 +622,8 @@ def close_with_notice(st, num, comment, dry, listed_open=True):
     if dry:
         log(f"  [dry-run] schlösse #{num}: {comment[:160]}")
         return
-    rec = st["issues"].setdefault(str(num), {})
-    need(rec.get("state") in STATES, "abschluss-ohne-vorgang")  # Review K2 P3: nie einen Datensatz ohne Vorgangszustand anlegen
+    rec = st["issues"].get(str(num))  # Review K2 N1 / Grok: erst prüfen, nie einen leeren Datensatz anlegen (sonst load_state-Abbruch)
+    need(isinstance(rec, dict) and rec.get("state") in STATES, "abschluss-ohne-vorgang")
     if rec.get("abschluss") == "geschlossen":  # Review Grok P3: kein GET für längst Abgeschlossenes
         if listed_open and still_open(num):  # wiedereröffnet → nur schließen, kein neuer Kommentar
             gh(f"repos/{SHOP}/issues/{num}", "PATCH", {"state": "closed"})
@@ -837,10 +841,24 @@ def dispatch(st, net, net_name, iss, action, dry):
 
 def offene_gates(st):
     """Vorgänge, die auf den Inhaber warten: widerruf-offen oder ein Kommentar im Zustand unklar (Review K2 P2)."""
+    wartend = {"unklar", "post-gestartet"}  # Review Grok R4: post-gestartet außerhalb des Fensters bleibt sonst stumm
     nums = {int(k) for k, v in st["issues"].items()
-            if v.get("state") == "widerruf-offen" or "unklar" in (v.get("abschluss"), v.get("widerruf_kommentar"))}
-    nums |= {int(k) for k, v in st.get("ephemer", {}).items() if v.get("kommentar") == "unklar"}
+            if v.get("state") == "widerruf-offen" or v.get("abschluss") in wartend or v.get("widerruf_kommentar") in wartend}
+    nums |= {int(k) for k, v in st.get("ephemer", {}).items() if v.get("kommentar") in wartend}
     return sorted(nums)
+
+
+SIGNAL_WIEDERHOLUNG_S = 86_400  # Review Grok R4 P2: dasselbe offene Gate nicht in jedem Cron-Lauf erneut senden
+
+
+def signal_faellig(st, gates):
+    """True, wenn sich die Menge geändert hat oder das letzte Signal älter als SIGNAL_WIEDERHOLUNG_S ist; merkt sich den Versand."""
+    last = st.get("signal") or {}
+    now = int(time.time())
+    if last.get("gates") == gates and now - int(last.get("at", 0)) < SIGNAL_WIEDERHOLUNG_S:
+        return False
+    st["signal"] = {"gates": gates, "at": now}
+    return True
 
 
 def signal_mensch(text):
@@ -850,7 +868,9 @@ def signal_mensch(text):
         log("notify-telegram nicht vorhanden — Signal nur über rc 2")
         return
     try:
-        subprocess.run([exe, "-t", "kcs-402 Prüfer: Menschen-Gate", text[:900]], capture_output=True, text=True, timeout=30)
+        proc = subprocess.run([exe, "-t", "kcs-402 Prüfer: Menschen-Gate", text[:900]], capture_output=True, text=True, timeout=30)
+        if proc.returncode != 0:  # Review K2 N2
+            log(f"notify-telegram rc={proc.returncode}: {(proc.stderr or '').strip()[:120]}")
     except Exception as exc:  # noqa: BLE001 — das Signal darf den Lauf nicht brechen
         log(f"notify-telegram fehlgeschlagen: {str(exc)[:120]}")
 
@@ -922,8 +942,9 @@ def main():
         if gates:
             text = f"MENSCHEN-GATE offen: {len(gates)} Vorgang/Vorgänge, Issues {', '.join('#' + str(n) for n in gates)} (widerruf-offen oder Kommentar unklar) — Entscheid des Inhabers nötig"
             log(text)
-            if not args.dry_run:
+            if not args.dry_run and signal_faellig(st, gates):
                 signal_mensch(text)
+                save_state(st, False)  # Versandzeitpunkt sichern
             log("fertig (rc 2: Menschen-Gate offen)")
             return 2
         log("fertig")

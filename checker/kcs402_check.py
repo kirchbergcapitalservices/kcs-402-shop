@@ -32,6 +32,13 @@ MIN_CONF, CAP, MAX_OPEN, MAX_PAGES = 5, 10, 3, 200
 RECONCILE_H = 48  # Astra R3 P1: kürzlich geschlossene Claims nachversöhnen (Schließen/Broadcast-Race)
 NET_ALIASES = {"sepolia": "sepolia", "base-sepolia": "sepolia", "mainnet": "mainnet", "base": "mainnet", "base-mainnet": "mainnet"}
 STATES = {"offen", "gesehen", "geprüft", "eingeladen", "abgelehnt", "widerruf-offen"}
+# Astra R7 P2: Kommentar/Abschluss hat einen eigenen Zustand je Art. "post-gestartet" wird VOR dem POST gesichert;
+# ein Wiederanlauf in diesem Zustand postet nie automatisch erneut, sondern sucht den Marker in den vorhandenen
+# Kommentaren — fehlt er, ist der Ausgang unklar und ein Mensch entscheidet (--kommentar-freigeben).
+KOMMENTAR_FELD = {"abschluss": "abschluss", "widerruf": "widerruf_kommentar", "ephemer": "kommentar"}
+# "ephemer" (Fremdtitel/Überzahl ohne Vorgang) liegt in st["ephemer"][<nr>] = {"kommentar": <zustand>}, nicht in issues
+# (dort verlangt load_state einen Vorgangszustand). Review Grok/vibe 25.10.: close_ephemeral durch denselben Automaten.
+KOMMENTAR_ZUSTAENDE = {"post-gestartet", "kommentiert", "geschlossen", "unklar"}
 PERMS = {"admin", "maintain", "write", "triage", "read"}
 HEX64 = re.compile(r"^0x[0-9a-fA-F]{64}$")
 HEXQ = re.compile(r"^0x[0-9a-fA-F]{1,64}$")
@@ -85,7 +92,7 @@ def login_or_empty(v):
 
 
 def gh(path, method=None, fields=None, allow_404=False, timeout=60):
-    need(GH_PATH.fullmatch(path), "gh-pfad")
+    need(path == "user" or GH_PATH.fullmatch(path), "gh-pfad")  # "user" nur für own_login()
     cmd = ["gh", "api", path]
     # K0-Fix 25.10.2026: ohne explizites -X macht `gh api` aus -f-Feldern einen POST.
     # Ein Lesen mit Filtern würde so versuchen, ein Issue anzulegen (HTTP 422 im Trockenlauf).
@@ -140,7 +147,7 @@ def rpc(url, method, params):
 
 
 def empty_state():
-    return {"used_hashes": {}, "issues": {}, "invites": [], "_dry_holds": 0, "last_ok": 0}
+    return {"used_hashes": {}, "issues": {}, "invites": [], "ephemer": {}, "_dry_holds": 0, "last_ok": 0}
 
 
 def load_state():
@@ -175,6 +182,9 @@ def load_state():
         for flag in ("notified", "invite_started", "we_added", "pre_existing"):
             if isinstance(val.get(flag), bool):
                 item[flag] = val[flag]
+        for feld in KOMMENTAR_FELD.values():  # Astra R7 P2
+            if val.get(feld) in KOMMENTAR_ZUSTAENDE:
+                item[feld] = val[feld]
         if isinstance(val.get("paid_units"), int) and val["paid_units"] >= 0:
             item["paid_units"] = val["paid_units"]
         st["issues"][key] = item
@@ -182,13 +192,20 @@ def load_state():
         need(isinstance(inv, dict) and isinstance(inv.get("issue"), int), "invite")
         need(isinstance(inv.get("day"), str) and re.fullmatch(r"\d{4}-\d{2}-\d{2}", inv["day"]), "tag")
         st["invites"].append({"day": inv["day"], "issue": inv["issue"]})
+    raw_e = data.get("ephemer", {})
+    need(isinstance(raw_e, dict), "ephemer")
+    for key, val in raw_e.items():
+        need(isinstance(key, str) and ISSUE_KEY.fullmatch(key) and isinstance(val, dict), "ephemer")
+        if val.get("kommentar") in KOMMENTAR_ZUSTAENDE:
+            st["ephemer"][key] = {"kommentar": val["kommentar"]}
     return st
 
 
 def save_state(st, dry):
     if dry:
         return
-    clean = {"used_hashes": st["used_hashes"], "issues": st["issues"], "invites": st["invites"], "last_ok": st.get("last_ok", 0)}
+    clean = {"used_hashes": st["used_hashes"], "issues": st["issues"], "invites": st["invites"], "ephemer": st.get("ephemer", {}),
+             "last_ok": st.get("last_ok", 0)}
     payload = json.dumps(clean, indent=1, sort_keys=True) + "\n"
     tmp = STATE_DIR / ".state.json.tmp"
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_CLOEXEC, 0o600)
@@ -361,6 +378,13 @@ def build_plan(issues, st):
                 iss["login"] = iss["login"] or stored_login(st, num, iss.get("tx"))
                 plan.append((iss, "process"))
             continue
+        # Review Grok 25.10. (P1): ein vom Kommentar-Gate offen gehaltenes, schon entschiedenes Issue (abgelehnt,
+        # eingeladen, geprüft, widerruf-offen) darf kein jüngeres bezahltes Issue desselben Autors als "excess" verdrängen —
+        # es wird verarbeitet, zählt aber nicht gegen MAX_OPEN.
+        if committed or rec.get("state") == "abgelehnt":
+            iss["login"] = iss["login"] or stored_login(st, num, rec.get("tx") or iss.get("tx"))
+            plan.append((iss, "process"))
+            continue
         login = iss["login"] or stored_login(st, num, iss.get("tx"))
         iss["login"] = login
         if not login and not committed:
@@ -453,38 +477,156 @@ def next_action(status, code, started):
     return "wait"
 
 
+def marker(kind, num):
+    """Deterministischer, unsichtbarer Marker je Issue und Kommentarart (HTML-Kommentar, von GitHub nicht gerendert)."""
+    need(kind in ("abschluss", "widerruf", "ephemer") and isinstance(num, int), "marker")
+    return f"<!-- kcs-402:{kind}:#{num} -->"
+
+
+_OWN_LOGIN = None
+
+
+def own_login():
+    """Login des Prüfer-Kontos (einmal je Lauf). Review Grok/vibe 25.10.: Marker zählen nur in eigenen Kommentaren."""
+    global _OWN_LOGIN
+    if _OWN_LOGIN is None:
+        me = gh("user")
+        login = me.get("login") if isinstance(me, dict) else None
+        need(isinstance(login, str) and LOGIN_RE.fullmatch(login), "own-login")
+        _OWN_LOGIN = login
+    return _OWN_LOGIN
+
+
+def list_comments(num):
+    """Alle Kommentare eines Issues als (login, body), vollständig paginiert; Grenze erreicht = Fehler, nie Teilmenge."""
+    bodies, seen = [], set()
+    for page in range(1, MAX_PAGES + 1):
+        batch = gh(f"repos/{SHOP}/issues/{num}/comments", fields={"per_page": "100", "page": str(page)}, timeout=90)
+        need(isinstance(batch, list), "kommentar-liste")
+        if not batch:
+            break
+        fresh = 0
+        for item in batch:
+            cid = item.get("id") if isinstance(item, dict) else None
+            if cid in seen:
+                continue
+            seen.add(cid)
+            user = item.get("user") if isinstance(item, dict) else None
+            author = user.get("login") if isinstance(user, dict) else None
+            bodies.append((author if isinstance(author, str) else "", str(item.get("body") or "")))
+            fresh += 1
+        if len(batch) < 100:
+            break
+        if fresh == 0:
+            raise RuntimeError("Kommentar-Pagination liefert volle Seite ohne neue Einträge — abgebrochen")
+    else:
+        raise RuntimeError(f"Kommentar-Pagination-Grenze {MAX_PAGES} Seiten erreicht — abgebrochen, Liste unvollständig")
+    return bodies
+
+
+def has_marker(num, kind):
+    """Nur ein Kommentar des eigenen Kontos mit dem Marker zählt — ein fremder Marker-Text bleibt wirkungslos."""
+    mark, me = marker(kind, num), own_login()
+    return any(author == me and mark in body for author, body in list_comments(num))
+
+
+def comment_once(st, num, kind, body):
+    """Astra R7 P2: genau ein Kommentar je Issue und Art, auch bei verlorener POST-Antwort oder Absturz.
+    True = Kommentar steht (jetzt oder schon vorher); False = Menschen-Gate, kein weiterer POST."""
+    feld = KOMMENTAR_FELD[kind]
+    if kind == "ephemer":
+        rec = st.setdefault("ephemer", {}).setdefault(str(num), {})
+    else:
+        rec = st["issues"].setdefault(str(num), {})
+        need(rec.get("state") in STATES, "kommentar-ohne-vorgang")  # sonst wäre state.json beim nächsten Lauf unlesbar
+    cur = rec.get(feld)
+    if cur in ("kommentiert", "geschlossen"):
+        return True
+    if kind == "abschluss" and cur is None and rec.get("notified"):  # Altformat vor R7
+        rec[feld] = "kommentiert"
+        save_state(st, False)
+        return True
+    if cur in ("post-gestartet", "unklar"):
+        # Ausgang eines früheren POST unbekannt: nur den Marker suchen, nie automatisch erneut posten.
+        if has_marker(num, kind):
+            rec[feld], rec["notified"] = "kommentiert", True
+            save_state(st, False)
+            return True
+        if cur != "unklar":
+            rec[feld] = "unklar"
+            save_state(st, False)
+        log(f"#{num} MENSCHEN-GATE {kind}-Kommentar unklar: früherer POST ohne bestätigtes Ergebnis, kein Marker gefunden"
+            f" — manuell prüfen, dann --kommentar-freigeben {num}")
+        return False
+    if has_marker(num, kind):  # Absturz zwischen POST und Zustandssicherung in einem früheren Lauf
+        rec[feld], rec["notified"] = "kommentiert", True
+        save_state(st, False)
+        return True
+    rec[feld] = "post-gestartet"
+    save_state(st, False)  # VOR dem POST sichern: ein Absturz hinterlässt einen sichtbaren, nicht wiederholenden Zustand
+    try:
+        gh(f"repos/{SHOP}/issues/{num}/comments", "POST", {"body": f"{body} {marker(kind, num)}"})
+    except Exception as exc:  # noqa: BLE001 — Ausgang unbekannt (Timeout, 5xx, Netz): kein zweiter Versuch
+        rec[feld] = "unklar"
+        save_state(st, False)
+        log(f"#{num} MENSCHEN-GATE {kind}-Kommentar unklar: POST ohne bestätigtes Ergebnis ({str(exc)[:160]})"
+            f" — manuell prüfen, dann --kommentar-freigeben {num}")
+        return False
+    rec[feld], rec["notified"] = "kommentiert", True
+    save_state(st, False)
+    return True
+
+
 def still_open(num):
     """Astra R4 P2: vor jedem Kommentar/Schließen den aktuellen Zustand lesen; geschlossen = keine Außenaktion."""
     cur = gh(f"repos/{SHOP}/issues/{num}", allow_404=True)
     return isinstance(cur, dict) and cur.get("state") == "open"
 
 
-def close_ephemeral(num, comment, dry):
+def close_ephemeral(st, num, comment, dry):
+    """Fremdtitel/Überzahl: Kommentar + Schließen über denselben Automaten wie close_with_notice (Review Grok/vibe 25.10.)."""
     if dry:
         log(f"  [dry-run] schlösse #{num}: {comment}")
         return
+    rec = st.setdefault("ephemer", {}).setdefault(str(num), {})
+    if rec.get("kommentar") == "geschlossen":  # Review Grok R2 P2: wiedereröffnet → nur schließen, kein neuer Kommentar
+        if still_open(num):
+            gh(f"repos/{SHOP}/issues/{num}", "PATCH", {"state": "closed"})
+        return
     if not still_open(num):
         log(f"#{num} inzwischen geschlossen — kein Kommentar, kein Schließen")
+        rec["kommentar"] = "geschlossen"
+        save_state(st, False)
         return
-    gh(f"repos/{SHOP}/issues/{num}/comments", "POST", {"body": comment})
+    if not comment_once(st, num, "ephemer", comment):  # Menschen-Gate → auch kein Schließen
+        return
     if still_open(num):  # Astra R5 P2: vor jedem Schreibaufruf getrennt prüfen
         gh(f"repos/{SHOP}/issues/{num}", "PATCH", {"state": "closed"})
+    rec["kommentar"] = "geschlossen"
+    save_state(st, False)
 
 
-def close_with_notice(st, num, comment, dry):
+def close_with_notice(st, num, comment, dry, listed_open=True):
+    """listed_open: GitHub führt das Issue in diesem Lauf als offen (Review Grok R2 P2: wiedereröffnete Terminal-Issues nur schließen)."""
     if dry:
         log(f"  [dry-run] schlösse #{num}: {comment[:160]}")
         return
     rec = st["issues"].setdefault(str(num), {})
+    if rec.get("abschluss") == "geschlossen":  # Review Grok P3: kein GET für längst Abgeschlossenes
+        if listed_open and still_open(num):  # wiedereröffnet → nur schließen, kein neuer Kommentar
+            gh(f"repos/{SHOP}/issues/{num}", "PATCH", {"state": "closed"})
+        return
     if not still_open(num):
         log(f"#{num} inzwischen geschlossen — Zustand gesichert, keine Außenaktion")
-        return
-    if not rec.get("notified"):
-        gh(f"repos/{SHOP}/issues/{num}/comments", "POST", {"body": comment})
-        rec["notified"] = True
+        rec["abschluss"] = "geschlossen"  # Review Grok R2 P2: Terminalzustand sichern (z. B. Absturz zwischen PATCH und save), sonst GET je Lauf
         save_state(st, False)
+        return
+    if not comment_once(st, num, "abschluss", comment):  # Astra R7 P2: Menschen-Gate → auch kein Schließen
+        return
     if still_open(num):  # Astra R5 P2
         gh(f"repos/{SHOP}/issues/{num}", "PATCH", {"state": "closed"})
+    rec["abschluss"] = "geschlossen"
+    save_state(st, False)
 
 
 def has_access(login):
@@ -523,10 +665,8 @@ def revoke(st, num, login, tx, reason, dry):
     # Einladung, Kommentar, Schließen. Ein Widerruf bleibt "widerruf-offen" und wird von einem Menschen
     # entschieden; das Issue bleibt offen, der Hash bleibt gebunden.
     log(f"#{num} P1 WIDERRUF-OFFEN: {reason} — manuell prüfen (we_added={rec.get('we_added')}, login={rec['login']})")
-    if not rec.get("notified") and still_open(num):
-        gh(f"repos/{SHOP}/issues/{num}/comments", "POST", {"body": f"Zahlung nach Einladung nicht mehr gültig ({reason}). Wird manuell geprüft."})
-        rec["notified"] = True
-        save_state(st, False)
+    if rec.get("widerruf_kommentar") not in ("kommentiert", "geschlossen") and still_open(num):
+        comment_once(st, num, "widerruf", f"Zahlung nach Einladung nicht mehr gültig ({str(reason)[:200]}). Wird manuell geprüft.")  # Astra R7 P2
 
 
 def grant(st, net_name, iss, tx, paid, dry):
@@ -572,7 +712,7 @@ def reorg_watch(st, net, iss, rec, dry):
         return
     if status == "ok":
         # Astra R6 P2: Abschluss (Kommentar/Schließen) idempotent nachholen, falls er nach dem PUT scheiterte
-        close_with_notice(st, num, f"Zahlung geprüft. @{iss['login']} hat Lesezugang zu {WARE}.", dry)
+        close_with_notice(st, num, f"Zahlung geprüft. @{iss['login']} hat Lesezugang zu {WARE}.", dry, listed_open=not iss.get("closed"))
         return
     # Astra R6 P1: jede nach der Einladung festgestellte Abweichung (reject, not_found, not_canonical,
     # log_removed, low_conf) ist ein Menschen-Gate — nur echte RpcError (oben) werden erneut versucht.
@@ -654,7 +794,7 @@ def handle_paid(st, net, net_name, iss, dry):
 def dispatch(st, net, net_name, iss, action, dry):
     num, price = iss["number"], net[2]
     if action in MSG:
-        close_ephemeral(num, MSG[action], dry)
+        close_ephemeral(st, num, MSG[action], dry)
         return
     rec = st["issues"].get(str(num)) or {}
     state, login = rec.get("state", "offen"), iss["login"]
@@ -682,7 +822,7 @@ def dispatch(st, net, net_name, iss, action, dry):
         log(f"#{num} Anspruch offen, exakt {usdc(price + num)} USDC, danach Titel paid:<txhash>")
         return
     if state != "geprüft" and iss["kind"] != "paid":
-        close_ephemeral(num, MSG["foreign"], dry)
+        close_ephemeral(st, num, MSG["foreign"], dry)
         return
     handle_paid(st, net, net_name, iss, dry)
 
@@ -692,9 +832,13 @@ def main():
     ap.add_argument("--dry-run", action="store_true", help="nichts schreiben")
     ap.add_argument("--network", default=os.environ.get("KCS402_NETWORK", "sepolia"), choices=sorted(NET_ALIASES))
     ap.add_argument("--once-issue", type=int, default=None)
+    ap.add_argument("--kommentar-freigeben", type=int, default=None, metavar="ISSUE",
+                    help="Menschen-Gate (Astra R7 P2): nach manueller Prüfung, dass kein Kommentar existiert, einen neuen Versuch erlauben; sonst kein Lauf")
     args = ap.parse_args()
     if args.once_issue is not None and not 1 <= args.once_issue <= 99_999_999:
         ap.error("--once-issue außerhalb 1..99999999")
+    if args.kommentar_freigeben is not None and not 1 <= args.kommentar_freigeben <= 99_999_999:
+        ap.error("--kommentar-freigeben außerhalb 1..99999999")
     args.network = NET_ALIASES[args.network.lower()]
     net = NETS[args.network]
     need(net[0].startswith("https://") and ADDR.fullmatch(net[1]) and isinstance(net[2], int) and net[2] > 0, "netz")
@@ -706,6 +850,16 @@ def main():
         return 0
     try:
         st = load_state()
+        if args.kommentar_freigeben is not None:  # Astra R7 P2: Inhaber-Entscheid, kein regulärer Lauf
+            key = str(args.kommentar_freigeben)
+            rec, eph = st["issues"].get(key) or {}, st.get("ephemer", {}).get(key) or {}
+            frei = [f for f in ("abschluss", "widerruf_kommentar") if rec.get(f) == "unklar"] + (["kommentar"] if eph.get("kommentar") == "unklar" else [])
+            for f in frei:
+                (eph if f == "kommentar" else rec).pop(f, None)
+            if frei and not args.dry_run:
+                save_state(st, False)
+            log(f"#{args.kommentar_freigeben} Kommentar-Freigabe: {', '.join(frei) or 'nichts unklar'} (dry={args.dry_run})")
+            return 0
         issues = []
         loaded = list_open_issues() + list_recently_closed(st)
         loaded += pending_from_state(st, {r.get("number") for r in loaded if isinstance(r, dict)})
@@ -730,6 +884,10 @@ def main():
             except Exception as exc:
                 log(f"#{iss['number']} Fehler, übersprungen (bleibt offen, falls nicht schon persistiert): {exc}")
         if not args.dry_run and args.once_issue is None:  # Astra R5 P1: Einzel-Lauf verschiebt den Wasserstand nicht
+            # Review Grok R2 P2: abgeschlossene ephemer-Einträge nicht mehr offener Issues entfernen (state.json ≤ 5 MB)
+            open_nums = {str(i["number"]) for i in issues if not i.get("closed")}
+            for key in [k for k, v in st.get("ephemer", {}).items() if v.get("kommentar") == "geschlossen" and k not in open_nums]:
+                del st["ephemer"][key]
             st["last_ok"] = int(time.time())
             save_state(st, False)
         log("fertig")

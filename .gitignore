@@ -4,3 +4,6 @@ buyer/ledger.jsonl
 *.key
 .env
 .vercel
+__pycache__/
+*.pyc
+buyer/kcs402.lock

@@ -230,7 +230,9 @@ def http_json(url: str, payload: dict | None, ok: tuple[int, ...]) -> tuple[int,
     data = None if payload is None else json.dumps(payload).encode()
     req = urllib.request.Request(
         url, data=data, method="POST" if payload is not None else "GET",
-        headers={"Accept": "application/json", "Content-Type": "application/json"},
+        # K0 25.10.2026: sepolia.base.org/mainnet.base.org antworten dem Standard-UA "Python-urllib/x" mit 403 (Bot-Filter);
+        # eigener UA wie beim Prüfer ("kcs-402-checker"). Keine Geheimnisse im Header.
+        headers={"Accept": "application/json", "Content-Type": "application/json", "User-Agent": "kcs-402-buyer/0.2"},
     )
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:

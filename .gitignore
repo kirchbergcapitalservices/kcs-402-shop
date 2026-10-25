@@ -3,3 +3,4 @@ buyer/.venv/
 buyer/ledger.jsonl
 *.key
 .env
+.vercel

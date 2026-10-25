@@ -11,4 +11,17 @@ Ablauf (HTTP 402 „Payment Required“, selbst gebaut):
 
 Es gibt keinen Server mit Schlüssel. Die Identität des Käufers ist sein GitHub-Konto (Issue-Autor), die Zahlung ist öffentlich auf der Chain prüfbar.
 
-Stand: Testnetz (Base Sepolia). Plan und Sicherheitsmodell: knowledge-hub `wiki/projects/krypto-kirchberg-setup.md`.
+## Status (25.10.2026)
+
+| Teil | Stand |
+|---|---|
+| `api/repo-access.js` (Schaufenster, 0 Abhängigkeiten) | **live**, Testnetz Base Sepolia, Schema `kcs-402/0.2`; von Astra in 5 Runden als konsistent bestätigt |
+| `checker/kcs402_check.py` (Prüfer, Stdlib, nur lesend außer Einladung) | **nicht freigegeben** — Astra Runde 5 BLOCK, Patch Runde 6 eingebaut, Verifikation ausstehend; läuft nirgends als Cron |
+| `buyer/kcs402_buy.py` (Käufer, eth-account nur Signatur) | **nicht freigegeben** — braucht Sandbox-Approve für `eth-account` und das Käufer-Wallet; nie mit Geld gelaufen |
+
+Zuordnungsregel: Käufer eröffnet Issue `claim` → Nummer N → zahlt exakt `basePrice.units + N` Basiseinheiten USDC → setzt Titel `paid:<txhash>`.
+Prüfer: Receipt `status 0x1`, kanonischer Block, genau ein USDC-`Transfer` an die Empfangsadresse mit exakt diesem Betrag, ≥ 5 Bestätigungen,
+Blockzeit nach `created_at`, Hash einmalig; Einladung nur an den Issue-Autor. Geschlossene `claim`-Issues werden nachversöhnt (Wasserstand),
+Widerruf ist ein Menschen-Gate (kein DELETE durch den Prüfer).
+
+Plan, Sicherheitsmodell und alle Astra-Protokolle: knowledge-hub `wiki/projects/krypto-kirchberg-setup.md` · Agent-Team: `wiki/projects/krypto-agent-team.md`.

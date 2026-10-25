@@ -11,6 +11,7 @@ import fcntl
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -542,14 +543,16 @@ def comment_once(st, num, kind, body):
     cur = rec.get(feld)
     if cur in ("kommentiert", "geschlossen"):
         return True
-    if kind == "abschluss" and cur is None and rec.get("notified"):  # Altformat vor R7
+    if kind == "abschluss" and cur is None and rec.get("notified") and not rec.get("widerruf_kommentar"):  # Altformat vor R7 (Review K2 P3)
         rec[feld] = "kommentiert"
         save_state(st, False)
         return True
     if cur in ("post-gestartet", "unklar"):
         # Ausgang eines früheren POST unbekannt: nur den Marker suchen, nie automatisch erneut posten.
         if has_marker(num, kind):
-            rec[feld], rec["notified"] = "kommentiert", True
+            rec[feld] = "kommentiert"
+            if kind == "abschluss":  # Review K2 P3: notified gilt nur für den Abschluss-Kommentar
+                rec["notified"] = True
             save_state(st, False)
             return True
         if cur != "unklar":
@@ -559,7 +562,9 @@ def comment_once(st, num, kind, body):
             f" — manuell prüfen, dann --kommentar-freigeben {num}")
         return False
     if has_marker(num, kind):  # Absturz zwischen POST und Zustandssicherung in einem früheren Lauf
-        rec[feld], rec["notified"] = "kommentiert", True
+        rec[feld] = "kommentiert"
+        if kind == "abschluss":  # Review K2 P3: notified gilt nur für den Abschluss-Kommentar
+            rec["notified"] = True
         save_state(st, False)
         return True
     rec[feld] = "post-gestartet"
@@ -572,7 +577,9 @@ def comment_once(st, num, kind, body):
         log(f"#{num} MENSCHEN-GATE {kind}-Kommentar unklar: POST ohne bestätigtes Ergebnis ({str(exc)[:160]})"
             f" — manuell prüfen, dann --kommentar-freigeben {num}")
         return False
-    rec[feld], rec["notified"] = "kommentiert", True
+    rec[feld] = "kommentiert"
+    if kind == "abschluss":  # Review K2 P3: notified gilt nur für den Abschluss-Kommentar
+        rec["notified"] = True
     save_state(st, False)
     return True
 
@@ -612,6 +619,7 @@ def close_with_notice(st, num, comment, dry, listed_open=True):
         log(f"  [dry-run] schlösse #{num}: {comment[:160]}")
         return
     rec = st["issues"].setdefault(str(num), {})
+    need(rec.get("state") in STATES, "abschluss-ohne-vorgang")  # Review K2 P3: nie einen Datensatz ohne Vorgangszustand anlegen
     if rec.get("abschluss") == "geschlossen":  # Review Grok P3: kein GET für längst Abgeschlossenes
         if listed_open and still_open(num):  # wiedereröffnet → nur schließen, kein neuer Kommentar
             gh(f"repos/{SHOP}/issues/{num}", "PATCH", {"state": "closed"})
@@ -827,6 +835,26 @@ def dispatch(st, net, net_name, iss, action, dry):
     handle_paid(st, net, net_name, iss, dry)
 
 
+def offene_gates(st):
+    """Vorgänge, die auf den Inhaber warten: widerruf-offen oder ein Kommentar im Zustand unklar (Review K2 P2)."""
+    nums = {int(k) for k, v in st["issues"].items()
+            if v.get("state") == "widerruf-offen" or "unklar" in (v.get("abschluss"), v.get("widerruf_kommentar"))}
+    nums |= {int(k) for k, v in st.get("ephemer", {}).items() if v.get("kommentar") == "unklar"}
+    return sorted(nums)
+
+
+def signal_mensch(text):
+    """Auslöser außerhalb des Logs: Fleet-Helfer notify-telegram, falls auf dem Node vorhanden (Plain-Text, keine Geheimnisse)."""
+    exe = shutil.which("notify-telegram")
+    if not exe:
+        log("notify-telegram nicht vorhanden — Signal nur über rc 2")
+        return
+    try:
+        subprocess.run([exe, "-t", "kcs-402 Prüfer: Menschen-Gate", text[:900]], capture_output=True, text=True, timeout=30)
+    except Exception as exc:  # noqa: BLE001 — das Signal darf den Lauf nicht brechen
+        log(f"notify-telegram fehlgeschlagen: {str(exc)[:120]}")
+
+
 def main():
     ap = argparse.ArgumentParser(description="kcs-402 Prüfer")
     ap.add_argument("--dry-run", action="store_true", help="nichts schreiben")
@@ -890,6 +918,14 @@ def main():
                 del st["ephemer"][key]
             st["last_ok"] = int(time.time())
             save_state(st, False)
+        gates = offene_gates(st)  # Review K2 P2: ein hängender Vorgang darf im Cron nicht stumm bleiben
+        if gates:
+            text = f"MENSCHEN-GATE offen: {len(gates)} Vorgang/Vorgänge, Issues {', '.join('#' + str(n) for n in gates)} (widerruf-offen oder Kommentar unklar) — Entscheid des Inhabers nötig"
+            log(text)
+            if not args.dry_run:
+                signal_mensch(text)
+            log("fertig (rc 2: Menschen-Gate offen)")
+            return 2
         log("fertig")
         return 0
     finally:

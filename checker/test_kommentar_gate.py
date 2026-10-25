@@ -164,8 +164,44 @@ check("S17c ephemer fremd geschlossen: Terminalzustand", not g.posts() and st["e
 # S18 main() bereinigt geschlossene ephemer-Einträge, behält unklar; Wasserstand gesetzt
 g = FakeGH(); m.gh = g; st = m.empty_state(); st["ephemer"]={"40":{"kommentar":"geschlossen"},"41":{"kommentar":"unklar"}}; m.save_state(st, False)
 sys.argv=["kcs402_check.py","--network","sepolia"]; rc=m.main(); st2=m.load_state()
-check("S18 ephemer bereinigt (geschlossen weg, unklar bleibt), rc 0, last_ok", rc==0 and "40" not in st2["ephemer"] and st2["ephemer"]["41"]["kommentar"]=="unklar" and st2["last_ok"]>0, str(st2["ephemer"]))
+check("S18 ephemer bereinigt (geschlossen weg, unklar bleibt), rc 2 wegen #41-Gate, last_ok", rc==2 and "40" not in st2["ephemer"] and st2["ephemer"]["41"]["kommentar"]=="unklar" and st2["last_ok"]>0, str(st2["ephemer"]))
 check("S18b main ohne Issues: keine Schreibaufrufe", not g.posts() and not g.patches())
+
+# S19 own_login scheitert (gh user 401) → Abbruch VOR post-gestartet, kein POST, Zustand None
+class GH401(FakeGH):
+    def __call__(self, path, method=None, fields=None, allow_404=False, timeout=60):
+        if path == "user": raise RuntimeError("gh GET user rc=1: HTTP 401")
+        return super().__call__(path, method, fields, allow_404, timeout)
+m._OWN_LOGIN = None; g = GH401(); m.gh = g; st = fresh(19)
+try:
+    m.close_with_notice(st, 19, "x", False); check("S19 own_login-Fehler wirft", False)
+except RuntimeError as e:
+    check("S19 own_login-Fehler: kein POST, kein post-gestartet", not g.posts() and st["issues"]["19"].get("abschluss") is None, str(e)[:40])
+m._OWN_LOGIN = None
+
+# S20 Freigabe über main --kommentar-freigeben (echter CLI-Pfad) löscht nur unklar, startet keinen Lauf
+g = FakeGH(); m.gh = g; st = m.empty_state(); st["issues"]["50"]={"state":"eingeladen","login":"bob","tx":"0x"+"aa"*32,"abschluss":"unklar"}; st["ephemer"]["51"]={"kommentar":"unklar"}; m.save_state(st, False)
+sys.argv=["kcs402_check.py","--kommentar-freigeben","50"]; rc=m.main(); st2=m.load_state()
+check("S20 Freigabe #50: abschluss weg, ephemer #51 bleibt, keine gh-Aufrufe, rc 0", rc==0 and "abschluss" not in st2["issues"]["50"] and st2["ephemer"]["51"]["kommentar"]=="unklar" and not g.calls)
+
+# S21 Probe B (K2): Widerruf-Kommentar setzt notified nicht → späterer Abschluss-Kommentar wird noch gepostet
+g = FakeGH(); m.gh = g; st = fresh(21); m.revoke(st, 21, "alice", "0x"+"ab"*32, "r", False)
+st["issues"]["21"]["state"]="eingeladen"; m.close_with_notice(st, 21, "Zugang besteht.", False)
+check("S21 widerruf + abschluss = zwei verschiedene Kommentare", len(g.posts())==2 and st["issues"]["21"]["abschluss"]=="geschlossen" and st["issues"]["21"].get("notified") is True)
+
+# S22 Menschen-Gate-Signal: main endet mit rc 2 und ruft signal_mensch; ohne Gate rc 0
+g = FakeGH(); m.gh = g; st = m.empty_state(); st["issues"]["60"]={"state":"eingeladen","login":"bob","tx":"0x"+"bb"*32,"abschluss":"unklar"}; m.save_state(st, False)
+signale=[]; m.signal_mensch = lambda t: signale.append(t); sys.argv=["kcs402_check.py","--network","sepolia"]; rc=m.main()
+check("S22 Gate offen → rc 2 + Signal mit Issue-Nummer", rc==2 and len(signale)==1 and "#60" in signale[0])
+signale.clear(); sys.argv=["kcs402_check.py","--network","sepolia","--dry-run"]; rc=m.main()
+check("S22b Trockenlauf: rc 2, aber kein Signal", rc==2 and not signale)
+st = m.empty_state(); m.save_state(st, False); rc=m.main(); check("S22c ohne Gate rc 0", rc==0 and not signale)
+
+# S23 close_with_notice ohne Vorgangszustand wird abgewiesen (K2 P3)
+try:
+    g = FakeGH(); m.gh = g; st = m.empty_state(); m.close_with_notice(st, 70, "x", False); check("S23 ohne Vorgang abgewiesen", False)
+except Exception as e:
+    check("S23 ohne Vorgang abgewiesen, kein gh-Aufruf", "abschluss-ohne-vorgang" in str(e) and not g.calls)
 
 # S11 Marker-Suche erkennt Pagination-Grenze als Fehler (nicht als 'kein Marker')
 g = FakeGH(); m.gh = g; g.comments[11] = [{"id": i, "body": "x"} for i in range(100*m.MAX_PAGES + 1)]

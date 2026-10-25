@@ -571,12 +571,13 @@ def reorg_watch(st, net, iss, rec, dry):
         log(f"#{num} Reorg-Wache: RPC-Fehler, später erneut: {exc}")
         return
     if status == "ok":
+        # Astra R6 P2: Abschluss (Kommentar/Schließen) idempotent nachholen, falls er nach dem PUT scheiterte
+        close_with_notice(st, num, f"Zahlung geprüft. @{iss['login']} hat Lesezugang zu {WARE}.", dry)
         return
-    if status == "reject" or code == "not_found":
-        log(f"#{num} P1 Reorg-Wache: Zahlung nach Einladung nicht mehr gültig ({detail})")
-        revoke(st, num, iss["login"], tx, detail, dry)
-    else:
-        log(f"#{num} Reorg-Wache: vorübergehend nicht kanonisch ({detail}), weiter beobachten")
+    # Astra R6 P1: jede nach der Einladung festgestellte Abweichung (reject, not_found, not_canonical,
+    # log_removed, low_conf) ist ein Menschen-Gate — nur echte RpcError (oben) werden erneut versucht.
+    log(f"#{num} P1 Reorg-Wache: Zahlungsgrundlage nach Einladung nicht mehr gültig ({code}: {detail})")
+    revoke(st, num, iss["login"], tx, f"{code}: {detail}", dry)
 
 
 def handle_paid(st, net, net_name, iss, dry):

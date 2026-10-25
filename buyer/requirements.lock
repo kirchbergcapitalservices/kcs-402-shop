@@ -1,0 +1,27 @@
+# buyer/requirements.lock — Stand 25.10.2026, Python 3.14.9, venv buyer/.venv
+# eth-account kommt NICHT von PyPI, sondern aus dem Vendor-Freeze (repo-vet --adopt, K2 25.10.2026):
+#   ~/vendor/ApeWorX/eth-account@e521f32817fa  (SHA e521f32817faf2f7f9096cb92a5c20f0f6fe6aa9, tree-hash 16d8a4e23f9fb43eb357f02d1ef1df9c6c4406c5b464d8d5a35a95061c3c3071)
+#   Build aus schreibbarer Kopie mit SETUPTOOLS_SCM_PRETEND_VERSION=0.14.0b1; die übrigen Pakete sind PyPI-Laufzeitabhängigkeiten, nicht einzeln gevettet.
+annotated-types==0.8.0
+bitarray==3.12.3
+ckzg==2.1.8
+cytoolz==1.2.0
+eth-hash==0.8.0
+eth-keyfile==0.10.0
+eth-keys==0.8.0
+eth-rlp==3.0.0
+eth-typing==6.0.0
+eth-utils==6.0.0
+eth_abi==6.0.0
+hexbytes==2.0.0
+parsimonious==0.10.0
+py-ecc==8.0.0
+pycryptodome==3.24.1
+pydantic==2.14.1
+pydantic_core==2.50.1
+regex==2026.9.29
+rlp==5.0.0
+toolz==1.2.0
+typing-inspection==0.4.4
+typing_extensions==4.16.0
+eth-account==0.14.0b1  # aus dem Freeze, siehe oben

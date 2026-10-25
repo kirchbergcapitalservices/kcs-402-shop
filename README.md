@@ -16,8 +16,8 @@ Es gibt keinen Server mit Schlüssel. Die Identität des Käufers ist sein GitHu
 | Teil | Stand |
 |---|---|
 | `api/repo-access.js` (Schaufenster, 0 Abhängigkeiten) | **live**, Testnetz Base Sepolia, Schema `kcs-402/0.2`; von Astra in 5 Runden als konsistent bestätigt |
-| `checker/kcs402_check.py` (Prüfer, Stdlib, nur lesend außer Einladung) | **nicht freigegeben** — Astra Runde 5 BLOCK, Patch Runde 6 eingebaut, Verifikation ausstehend; läuft nirgends als Cron |
-| `buyer/kcs402_buy.py` (Käufer, eth-account nur Signatur) | **nicht freigegeben** — braucht Sandbox-Approve für `eth-account` und das Käufer-Wallet; nie mit Geld gelaufen |
+| `checker/kcs402_check.py` (Prüfer, Stdlib, nur lesend außer Einladung) | **nicht freigegeben, aber verifiziert** — Astra Runde 7 (Delta Patch R7 `88e9029`) **OK-MIT-FIXES, kein P1**; ein P2 offen (Kommentar-Wiederholung, wenn ein POST erfolgreich war, die Antwort aber verloren ging → Marker-Suche statt Zweitkommentar); läuft nirgends als Cron, Testnetz-Kreis noch nicht gelaufen |
+| `buyer/kcs402_buy.py` (Käufer, eth-account nur Signatur) | **nicht freigegeben** — Sandbox-Approve `eth-account` erteilt 25.10. (Vendor-Freeze `ApeWorX/eth-account@e521f32817fa`, venv `buyer/.venv`, siehe `buyer/requirements.lock`); Wegwerf-Wallet in der K0-Keychain; nie mit Geld gelaufen, Trockenlauf siehe Wiki |
 
 Zuordnungsregel: Käufer eröffnet Issue `claim` → Nummer N → zahlt exakt `basePrice.units + N` Basiseinheiten USDC → setzt Titel `paid:<txhash>`.
 Prüfer: Receipt `status 0x1`, kanonischer Block, genau ein USDC-`Transfer` an die Empfangsadresse mit exakt diesem Betrag, ≥ 5 Bestätigungen,

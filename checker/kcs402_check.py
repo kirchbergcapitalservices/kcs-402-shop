@@ -44,7 +44,10 @@ STATES = {"offen", "gesehen", "geprüft", "eingeladen", "abgelehnt", "widerruf-o
 KOMMENTAR_FELD = {"abschluss": "abschluss", "widerruf": "widerruf_kommentar", "ephemer": "kommentar"}
 # "ephemer" (Fremdtitel/Überzahl ohne Vorgang) liegt in st["ephemer"][<nr>] = {"kommentar": <zustand>}, nicht in issues
 # (dort verlangt load_state einen Vorgangszustand). Review Grok/vibe 25.10.: close_ephemeral durch denselben Automaten.
-KOMMENTAR_ZUSTAENDE = {"post-gestartet", "kommentiert", "geschlossen", "unklar"}
+KOMMENTAR_ZUSTAENDE = {"post-gestartet", "kommentiert", "geschlossen", "unklar", "ersetzt"}  # ersetzt: Issue ist in den Zahlungspfad gewechselt
+STATE_WARN_BYTES = 4_000_000   # Warnung + rc 3, bevor load_state bei 5 MB fail-closed stoppt (Josef 26.10.: kein stilles Restrisiko)
+INVITES_BEHALTEN_TAGE = 2      # at_cap zählt nur heute; ältere Einträge sind Protokoll und stehen im Log/GitHub
+SIGNAL_RE = re.compile(r"^[1-9][0-9]{0,8}:[a-z0-9+-]{1,160}$")  # Signal-Gedächtnis je Issue MIT Art (Dedupe nach Art)
 BEFUNDE = {"gefunden", "nicht-gefunden", "unbekannt"}  # --gate-erledigt --befund (K2 R4 P3): Ergebnis der Inhaber-Prüfung auf der Kette
 PERMS = {"admin", "maintain", "write", "triage", "read"}
 HEX64 = re.compile(r"^0x[0-9a-fA-F]{64}$")
@@ -210,9 +213,14 @@ def load_state():
         need(isinstance(inv.get("day"), str) and re.fullmatch(r"\d{4}-\d{2}-\d{2}", inv["day"]), "tag")
         st["invites"].append({"day": inv["day"], "issue": inv["issue"]})
     sig = data.get("signal")
-    if isinstance(sig, dict) and isinstance(sig.get("gates"), list) and all(isinstance(n, int) for n in sig["gates"]) \
-            and isinstance(sig.get("at"), int) and sig["at"] >= 0:
-        st["signal"] = {"gates": sig["gates"], "at": sig["at"]}
+    if isinstance(sig, dict) and isinstance(sig.get("gates"), list) and isinstance(sig.get("at"), int) \
+            and not isinstance(sig["at"], bool) and sig["at"] >= 0:
+        gates = [str(g) if isinstance(g, int) and not isinstance(g, bool) else g for g in sig["gates"]]  # Altformat: Nummern ohne Art
+        if all(isinstance(g, str) and SIGNAL_RE.fullmatch(g) or (isinstance(g, str) and ISSUE_KEY.fullmatch(g)) for g in gates):
+            st["signal"] = {"gates": gates, "at": sig["at"]}
+    sga = data.get("signal_groesse_at")
+    if isinstance(sga, int) and not isinstance(sga, bool) and sga >= 0:
+        st["signal_groesse_at"] = sga
     raw_e = data.get("ephemer", {})
     need(isinstance(raw_e, dict), "ephemer")
     for key, val in raw_e.items():
@@ -226,7 +234,7 @@ def save_state(st, dry):
     if dry:
         return
     clean = {"used_hashes": st["used_hashes"], "issues": st["issues"], "invites": st["invites"], "ephemer": st.get("ephemer", {}),
-             "last_ok": st.get("last_ok", 0), "signal": st.get("signal") or {}}
+             "last_ok": st.get("last_ok", 0), "signal": st.get("signal") or {}, "signal_groesse_at": st.get("signal_groesse_at", 0)}
     payload = json.dumps(clean, indent=1, sort_keys=True) + "\n"
     tmp = STATE_DIR / ".state.json.tmp"
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_CLOEXEC, 0o600)
@@ -781,6 +789,10 @@ def handle_paid(st, net, net_name, iss, dry):
         # Astra R5 P1: Warteschlange — entdeckt, noch nicht abgeschlossen; KEINE Hash-Reservierung,
         # damit der Wasserstand diesen Vorgang nie überspringt.
         st["issues"][str(num)] = {"state": "gesehen", "login": login, "tx": tx, "seit": int(time.time())}
+        eph = st.get("ephemer", {}).get(str(num))
+        if eph and eph.get("kommentar") in ("unklar", "post-gestartet"):  # verwaistes Kommentar-Gate eines früheren Überzahl-Schließens
+            eph["kommentar"] = "ersetzt"
+            log(f"#{num} Überzahl-Kommentar-Gate durch Zahlungspfad ersetzt")
         save_state(st, False)
         rec = st["issues"][str(num)]
     try:
@@ -793,9 +805,10 @@ def handle_paid(st, net, net_name, iss, dry):
     if state in ("offen", "gesehen"):
         if status == "pending":
             seit = int(rec.get("seit", time.time())) if state == "gesehen" else int(time.time())
-            if code == "not_found" and int(time.time()) - seit > GESEHEN_MAX_S:
-                # K2 Bestand-P2: nie gefundene Transaktion nicht ewig nachladen. Hash nicht verbrauchen (consume=False).
-                fail_issue(st, num, login, tx, f"Transaktion nach {GESEHEN_MAX_S // 86_400} Tagen nicht gefunden. Kein Zugang. Für ein neues Issue ist eine neue Zahlung nötig; eine bereits geleistete Zahlung klärt der Inhaber.", dry, False, grund="frist")
+            if int(time.time()) - seit > GESEHEN_MAX_S:
+                # K2 Bestand-P2 + Josef 26.10. (kein Restrisiko): JEDES über 7 Tage schwebende Ergebnis (not_found, not_canonical,
+                # log_removed, low_conf) wird Menschen-Gate statt ewig nachgeladen. Hash nicht verbrauchen (consume=False).
+                fail_issue(st, num, login, tx, f"Zahlung nach {GESEHEN_MAX_S // 86_400} Tagen nicht bestätigt ({code}). Kein Zugang. Für ein neues Issue ist eine neue Zahlung nötig; eine bereits geleistete Zahlung klärt der Inhaber.", dry, False, grund="frist")
                 return
             log(f"#{num} wartet: {detail}")
             return
@@ -901,10 +914,55 @@ def offene_gates(st):
 SIGNAL_WIEDERHOLUNG_S = 86_400  # Review Grok R4 P2: dasselbe offene Gate nicht in jedem Cron-Lauf erneut senden
 
 
+def signal_signatur(st, gates):
+    """Issue-Nummer MIT Arten — ein Artwechsel derselben Nummer ist ein neues Signal (Dedupe nach Art)."""
+    arten = gate_arten(st)
+    return [f"{n}:{'+'.join(sorted(arten.get(n, [])))}" for n in gates]
+
+
 def signal_faellig(st, gates):
-    """True, wenn sich die Menge geändert hat oder das letzte Signal älter als SIGNAL_WIEDERHOLUNG_S ist. Liest nur."""
+    """True, wenn sich Menge oder Arten geändert haben oder das letzte Signal älter als SIGNAL_WIEDERHOLUNG_S ist. Liest nur."""
     last = st.get("signal") or {}
     return not (last.get("gates") == gates and int(time.time()) - int(last.get("at", 0)) < SIGNAL_WIEDERHOLUNG_S)
+
+
+def bereinigen(st, open_nums):
+    """Zustandsdatei begrenzen, ohne Sicherheitsdaten zu verlieren: used_hashes bleiben IMMER (Replay-Schutz).
+    Entfernt: Einladungen älter als INVITES_BEHALTEN_TAGE (at_cap zählt nur heute) · abgeschlossene Vorgänge geschlossener Issues
+    (abgelehnt ohne offenes Frist-Gate; eingeladen mit Abschluss nach Ende der Reorg-Wache — der Marker macht einen Wiederanlauf
+    idempotent, used_hashes trägt Issue + Login) · ephemer-Einträge geschlossen (nicht offen gelistet) oder ersetzt."""
+    grenze = time.strftime("%Y-%m-%d", time.gmtime(time.time() - INVITES_BEHALTEN_TAGE * 86_400))
+    vorher = len(st["invites"])
+    st["invites"] = [i for i in st["invites"] if str(i.get("day", "")) >= grenze]
+    weg = []
+    now = int(time.time())
+    for key, rec in st["issues"].items():
+        if key in open_nums:
+            continue
+        if rec.get("state") == "abgelehnt" and (rec.get("grund") != "frist" or rec.get("erledigt")):
+            weg.append(key)
+        elif rec.get("state") == "eingeladen" and rec.get("abschluss") == "geschlossen" and now - int(rec.get("seit", now)) > REORG_WACHE_S:
+            weg.append(key)
+    for key in weg:
+        del st["issues"][key]
+    eph_weg = [k for k, v in st.get("ephemer", {}).items() if v.get("kommentar") == "ersetzt" or (v.get("kommentar") == "geschlossen" and k not in open_nums)]
+    for key in eph_weg:
+        del st["ephemer"][key]
+    return {"invites": vorher - len(st["invites"]), "issues": len(weg), "ephemer": len(eph_weg)}
+
+
+def groesse_pruefen(st, dry):
+    """Warnung + rc 3 + Signal (einmal je 24 h), bevor die 5-MB-Grenze von load_state den Prüfer fail-closed anhält."""
+    path = STATE_DIR / "state.json"
+    size = path.stat().st_size if path.exists() else 0
+    if size <= STATE_WARN_BYTES:
+        return False
+    text = f"state.json {size / 1_000_000:.2f} MB — Grenze 5 MB (fail-closed). Bereinigung läuft; Inhaber prüft Wachstum (used_hashes bleiben)."
+    log("WARNUNG " + text)
+    if not dry and int(time.time()) - int(st.get("signal_groesse_at", 0)) >= SIGNAL_WIEDERHOLUNG_S and signal_mensch(text):
+        st["signal_groesse_at"] = int(time.time())
+        save_state(st, False)
+    return True
 
 
 def signal_merken(st, gates):
@@ -964,13 +1022,14 @@ def main():
         st = load_state()
         if args.gate_erledigt is not None:  # K2 R3 P2: Inhaber-Entscheid zur Frist-Ablehnung, kein regulärer Lauf
             rec = st["issues"].get(str(args.gate_erledigt)) or {}
-            if rec.get("state") == "abgelehnt" and rec.get("grund") == "frist" and not rec.get("erledigt"):
-                rec["erledigt"] = {"at": int(time.time()), "befund": args.befund}  # K2 R4 P3: Zeitpunkt + Prüfergebnis
+            if rec.get("state") == "abgelehnt" and rec.get("grund") == "frist":
+                vorher = (rec.get("erledigt") or {}).get("befund")
+                rec["erledigt"] = {"at": int(time.time()), "befund": args.befund}  # K2 R4 P3: Zeitpunkt + Prüfergebnis; Zweitaufruf = Korrektur
                 if not args.dry_run:
                     save_state(st, False)
-                log(f"#{args.gate_erledigt} Frist-Ablehnung als erledigt markiert: Befund {args.befund} (dry={args.dry_run})")
+                log(f"#{args.gate_erledigt} Frist-Ablehnung erledigt: Befund {args.befund}" + (f" (Korrektur, vorher {vorher})" if vorher else "") + f" (dry={args.dry_run})")
             else:
-                log(f"#{args.gate_erledigt} keine offene Frist-Ablehnung")
+                log(f"#{args.gate_erledigt} keine Frist-Ablehnung")
             return 0
         if args.kommentar_freigeben is not None:  # Astra R7 P2: Inhaber-Entscheid, kein regulärer Lauf
             key = str(args.kommentar_freigeben)
@@ -1007,12 +1066,13 @@ def main():
             except Exception as exc:
                 log(f"#{iss['number']} Fehler, übersprungen (bleibt offen, falls nicht schon persistiert): {exc}")
         if not args.dry_run and args.once_issue is None:  # Astra R5 P1: Einzel-Lauf verschiebt den Wasserstand nicht
-            # Review Grok R2 P2: abgeschlossene ephemer-Einträge nicht mehr offener Issues entfernen (state.json ≤ 5 MB)
             open_nums = {str(i["number"]) for i in issues if not i.get("closed")}
-            for key in [k for k, v in st.get("ephemer", {}).items() if v.get("kommentar") == "geschlossen" and k not in open_nums]:
-                del st["ephemer"][key]
+            weg = bereinigen(st, open_nums)  # Josef 26.10.: Wachstum begrenzen, used_hashes bleiben
+            if any(weg.values()):
+                log(f"bereinigt: {weg['issues']} Vorgänge, {weg['ephemer']} ephemer, {weg['invites']} alte Einladungen")
             st["last_ok"] = int(time.time())
             save_state(st, False)
+        gross = groesse_pruefen(st, args.dry_run)
         gates = offene_gates(st)  # Review K2 P2: ein hängender Vorgang darf im Cron nicht stumm bleiben
         if gates:
             arten = gate_arten(st)
@@ -1020,14 +1080,18 @@ def main():
                     + "; ".join(f"#{n} ({', '.join(arten.get(n, ['?']))})" for n in gates)
                     + " — Entscheid des Inhabers nötig (--kommentar-freigeben / --gate-erledigt --befund)")
             log(text)
-            if not args.dry_run and signal_faellig(st, gates) and signal_mensch(text):
-                signal_merken(st, gates)
+            sig = signal_signatur(st, gates)
+            if not args.dry_run and signal_faellig(st, sig) and signal_mensch(text):
+                signal_merken(st, sig)
                 save_state(st, False)  # Versandzeitpunkt sichern
             log("fertig (rc 2: Menschen-Gate offen)")
             return 2
         if st.get("signal") and not args.dry_run:  # Grok R5 P2: leere Menge löscht das Signal-Gedächtnis
             del st["signal"]
             save_state(st, False)
+        if gross:
+            log("fertig (rc 3: Zustandsdatei nahe der Grenze)")
+            return 3
         log("fertig")
         return 0
     finally:

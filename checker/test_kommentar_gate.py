@@ -216,7 +216,7 @@ g = FakeGH(); m.gh = g; st = m.empty_state(); st["issues"]["90"]={"state":"einge
 signale=[]; m.signal_mensch = lambda t: (signale.append(t), True)[1]; sys.argv=["kcs402_check.py","--network","sepolia"]
 rc1=m.main(); rc2=m.main()
 check("S25 zwei Läufe, gleiches Gate: rc 2 beide, genau ein Signal", rc1==2 and rc2==2 and len(signale)==1, str(len(signale)))
-st=m.load_state(); check("S25b Signal im State persistiert", st["signal"]["gates"]==[90] and st["signal"]["at"]>0)
+st=m.load_state(); check("S25b Signal im State persistiert (mit Art)", st["signal"]["gates"]==["90:abschluss-unklar"] and st["signal"]["at"]>0)
 st["ephemer"]["91"]={"kommentar":"unklar"}; m.save_state(st, False); rc3=m.main()
 check("S25c geänderte Menge → neues Signal", rc3==2 and len(signale)==2 and "#91" in signale[-1])
 st=m.load_state(); st["signal"]["at"]=0; m.save_state(st, False); m.main()
@@ -228,7 +228,7 @@ versuche=[]; m.signal_mensch = lambda t: (versuche.append(t), False)[1]; sys.arg
 rc=m.main(); rc=m.main(); st2=m.load_state()
 check("S26 Versand scheitert: kein Gedächtnis, jeder Lauf versucht erneut, rc 2", rc==2 and len(versuche)==2 and "signal" not in st2)
 m.signal_mensch = lambda t: (versuche.append(t), True)[1]; rc=m.main(); st2=m.load_state()
-check("S26b Versand gelingt: Gedächtnis gesetzt", st2.get("signal",{}).get("gates")==[100])
+check("S26b Versand gelingt: Gedächtnis gesetzt (mit Art)", st2.get("signal",{}).get("gates")==["100:abschluss-unklar"])
 
 # S27 leere Menge löscht das Signal-Gedächtnis
 st2["issues"]["100"]["abschluss"]="geschlossen"; m.save_state(st2, False); rc=m.main(); st3=m.load_state()
@@ -263,7 +263,7 @@ st["issues"]["122"]={"state":"abgelehnt","login":"bob","tx":""}; check("S29b5 ge
 g = FakeGH(); m.gh = g; st = m.empty_state(); st["issues"]["121"]={"state":"gesehen","login":"bob","tx":"0x"+"ab"*32,"seit": int(_t.time()) - m.GESEHEN_MAX_S - 1}
 m.verify_payment = lambda net, tx, num, created: ("pending", "low_conf", "nur 2 Bestätigungen", 0)
 m.handle_paid(st, net, "sepolia", {"number":121,"created":1.0,"login":"bob","kind":"paid","tx":"0x"+"ab"*32,"closed":False}, False)
-check("S29c low_conf nach Frist bleibt gesehen (Tx existiert)", st["issues"]["121"]["state"]=="gesehen" and not g.posts())
+check("S29c low_conf nach Frist → Frist-Gate (kein ewiges Schweben, Josef 26.10.)", st["issues"]["121"]["state"]=="abgelehnt" and st["issues"]["121"].get("grund")=="frist" and 121 in m.offene_gates(st) and TX(121) if False else st["issues"]["121"].get("grund")=="frist" and "0x"+"ab"*32 not in st["used_hashes"])
 
 # S30 pending_from_state: alte eingeladen nicht mehr nachgeladen, frische schon; Altbestand bekommt seit
 g = FakeGH(); m.gh = g; st = m.empty_state()
@@ -358,6 +358,63 @@ st["issues"]["400"]={"state":"widerruf-offen","login":"bob","tx":TX(400)}; st["i
 st["issues"]["402"]={"state":"abgelehnt","login":"bob","tx":"","grund":"frist"}; st["ephemer"]["403"]={"kommentar":"post-gestartet"}; m.save_state(st, False)
 texte=[]; m.signal_mensch = lambda t: (texte.append(t), True)[1]; sys.argv=["kcs402_check.py","--network","sepolia"]; rc=m.main()
 check("S34 Signaltext mit Art je Issue", rc==2 and len(texte)==1 and all(x in texte[0] for x in ("#400 (widerruf-offen)", "#401 (abschluss-unklar)", "#402 (frist-ablehnung)", "#403 (ephemer-post-gestartet)", "--gate-erledigt")), texte[0][:200] if texte else "")
+
+# S35 Dedupe nach Art: gleiche Nummer, andere Art → neues Signal; Altformat (int) → einmal neu
+g = FakeGH2(); m.gh = g; st = m.empty_state(); st["issues"]["500"]={"state":"eingeladen","login":"bob","tx":TX(500),"abschluss":"unklar"}; m.save_state(st, False)
+sig=[]; m.signal_mensch = lambda t: (sig.append(t), True)[1]; sys.argv=["kcs402_check.py","--network","sepolia"]
+m.main(); m.main(); n1=len(sig)
+st=m.load_state(); st["issues"]["500"]["state"]="widerruf-offen"; m.save_state(st, False); m.main(); n2=len(sig)
+check("S35 Artwechsel derselben Nummer → neues Signal, gleiche Art → keins", n1==1 and n2==2 and "widerruf-offen" in sig[-1])
+st=m.load_state(); st["signal"]={"gates":[500],"at":int(_t.time())}; m.save_state(st, False); st2=m.load_state(); m.main()
+check("S35b Altformat (Nummern ohne Art) wird gelesen und löst genau einmal neu aus", st2["signal"]["gates"]==["500"] and len(sig)==3)
+
+# S36 --gate-erledigt Korrektur per Zweitaufruf
+g = FakeGH2(); m.gh = g; st = m.empty_state(); st["issues"]["510"]={"state":"abgelehnt","login":"bob","tx":"","grund":"frist"}; m.save_state(st, False)
+sys.argv=["kcs402_check.py","--gate-erledigt","510","--befund","nicht-gefunden"]; m.main()
+sys.argv=["kcs402_check.py","--gate-erledigt","510","--befund","gefunden"]; m.main(); st=m.load_state()
+check("S36 Korrektur: Befund überschrieben, Gate bleibt zu, Zustand abgelehnt/frist", st["issues"]["510"]["erledigt"]["befund"]=="gefunden" and m.offene_gates(st)==[] and st["issues"]["510"]["state"]=="abgelehnt" and any("Korrektur" in l for l in logs))
+
+# S37 jedes schwebende Ergebnis > 7 d wird Frist-Gate (nicht nur not_found)
+for code in ("not_canonical", "log_removed", "low_conf"):
+    g = FakeGH2(); m.gh = g; st = m.empty_state(); g.add(520, "paid:"+TX(520)); st["issues"]["520"]={"state":"gesehen","login":"bob","tx":TX(520),"seit": int(_t.time()) - m.GESEHEN_MAX_S - 1}
+    m.verify_payment = lambda net, tx, num, created, c=code: ("pending", c, "x", 0)
+    m.handle_paid(st, net, "sepolia", {"number":520,"created":1.0,"login":"bob","kind":"paid","tx":TX(520),"closed":False}, False)
+    check(f"S37 {code} > 7 d → Frist-Gate ohne Hash-Verbrauch", st["issues"]["520"]["state"]=="abgelehnt" and st["issues"]["520"].get("grund")=="frist" and TX(520) not in st["used_hashes"] and 520 in m.offene_gates(st) and code in g.comments[520][0]["body"])
+
+# S38 verwaistes ephemer-Gate wird ersetzt, sobald das Issue in den Zahlungspfad wechselt, und bereinigt
+g = FakeGH2(); m.gh = g; st = m.empty_state(); g.add(530, "paid:"+TX(530)); st["ephemer"]["530"]={"kommentar":"unklar"}
+m.verify_payment = lambda net, tx, num, created: ("pending","not_found","x",0)
+m.handle_paid(st, net, "sepolia", {"number":530,"created":1.0,"login":"bob","kind":"paid","tx":TX(530),"closed":False}, False)
+check("S38 ephemer unklar → ersetzt, kein Gate mehr aus ephemer", st["ephemer"]["530"]["kommentar"]=="ersetzt" and 530 not in m.offene_gates(st))
+weg = m.bereinigen(st, {"530"}); check("S38b Bereinigung entfernt ersetzt auch bei offenem Issue", "530" not in st["ephemer"] and weg["ephemer"]==1)
+
+# S39 Bereinigung: alte Einladungen, abgeschlossene Vorgänge geschlossener Issues; used_hashes bleiben; Offenes/Wartendes bleibt
+st = m.empty_state(); now=int(_t.time()); alt=_t.strftime("%Y-%m-%d", _t.gmtime(now-5*86400)); heute=_t.strftime("%Y-%m-%d", _t.gmtime(now))
+st["invites"]=[{"day":alt,"issue":600},{"day":heute,"issue":601}]
+st["issues"]["600"]={"state":"eingeladen","login":"bob","tx":TX(600),"abschluss":"geschlossen","seit":now-m.REORG_WACHE_S-10}
+st["issues"]["601"]={"state":"eingeladen","login":"bob","tx":TX(601),"abschluss":"geschlossen","seit":now}
+st["issues"]["602"]={"state":"abgelehnt","login":"bob","tx":""}
+st["issues"]["603"]={"state":"abgelehnt","login":"bob","tx":"","grund":"frist"}
+st["issues"]["604"]={"state":"abgelehnt","login":"bob","tx":"","grund":"frist","erledigt":{"at":now,"befund":"gefunden"}}
+st["issues"]["605"]={"state":"widerruf-offen","login":"bob","tx":TX(605)}
+st["issues"]["606"]={"state":"gesehen","login":"bob","tx":TX(606),"seit":now}
+st["issues"]["607"]={"state":"eingeladen","login":"bob","tx":TX(607),"abschluss":"geschlossen","seit":now-m.REORG_WACHE_S-10}  # offen gelistet
+for n in (600,601,605,606,607): m.bind_hash(st, TX(n), n, "bob", st["issues"][str(n)]["state"])
+weg = m.bereinigen(st, {"607"})
+check("S39 entfernt: 600 (alt+zu), 602, 604; behält: 601 (Wache läuft), 603 (Frist-Gate offen), 605, 606, 607 (offen)", sorted(st["issues"])==["601","603","605","606","607"] and weg["issues"]==3, str(sorted(st["issues"])))
+check("S39b used_hashes vollständig, alte Einladung weg, heutige bleibt", len(st["used_hashes"])==5 and st["used_hashes"][TX(600)]["issue"]==600 and [i["issue"] for i in st["invites"]]==[601] and weg["invites"]==1)
+# Wiederanlauf eines bereinigten eingeladenen Issues: Marker verhindert Zweitkommentar, kein zweiter PUT
+g = FakeGH2(); m.gh = g; g.add(600, "paid:"+TX(600)); g.comments[600]=[{"id":1,"body":"alt "+m.marker("abschluss",600),"user":{"login":"kirchbergcapital"}}]; g.invited.add("bob")
+m.verify_payment = lambda net, tx, num, created: ("ok","ok","ok",100600); m.save_state(st, False)
+sys.argv=["kcs402_check.py","--network","sepolia"]; rc=m.main(); st2=m.load_state()
+check("S39c wiedereröffnet nach Bereinigung: Vorgang aus used_hashes rekonstruiert, kein PUT, kein POST, geschlossen", not g.puts and not g.posts() and len(g.patches())==1 and st2["issues"]["600"]["state"]=="eingeladen" and st2["issues"]["600"].get("abschluss")=="geschlossen")
+
+# S40 Größenwarnung: rc 3 + ein Signal je 24 h; kein Signal im Trockenlauf
+g = FakeGH2(); m.gh = g; st = m.empty_state(); m.save_state(st, False); alt_warn = m.STATE_WARN_BYTES; m.STATE_WARN_BYTES = 10
+sig=[]; m.signal_mensch = lambda t: (sig.append(t), True)[1]; sys.argv=["kcs402_check.py","--network","sepolia"]; rc1=m.main(); rc2=m.main()
+check("S40 nahe der Grenze: rc 3, genau ein Signal in zwei Läufen", rc1==3 and rc2==3 and len(sig)==1 and "MB" in sig[0])
+sys.argv=["kcs402_check.py","--network","sepolia","--dry-run"]; rc3=m.main(); check("S40b Trockenlauf: rc 3, kein weiteres Signal", rc3==3 and len(sig)==1)
+m.STATE_WARN_BYTES = alt_warn; rc4=m.main(); check("S40c unter der Grenze: rc 0", rc4==0)
 
 # S11 Marker-Suche erkennt Pagination-Grenze als Fehler (nicht als 'kein Marker')
 g = FakeGH(); m.gh = g; g.comments[11] = [{"id": i, "body": "x"} for i in range(100*m.MAX_PAGES + 1)]

@@ -518,7 +518,7 @@ check("S49 Widerruf-Befund korrigiert, Zustand bleibt abgelehnt/widerruf", rc==0
 # S50 grund wandert mit der Bindung: Rekonstruktion eines abgelehnt/widerruf ohne Vorgang behält den Entscheid-Pfad
 st = m.empty_state(); m.bind_hash(st, TX(740), 740, "bob", "abgelehnt", grund="widerruf"); m.save_state(st, False); st2=m.load_state()
 check("S50 grund im used_hashes-Roundtrip", st2["used_hashes"][TX(740)].get("grund")=="widerruf")
-g = FakeGH2(); m.gh = g; g.add(740, "paid:"+TX(740)); rc=m.main(); st3=m.load_state()
+g = FakeGH2(); m.gh = g; g.add(740, "paid:"+TX(740)); sys.argv=["kcs402_check.py","--network","sepolia"]; rc=m.main(); st3=m.load_state()
 check("S50b Rekonstruktion abgelehnt/widerruf: Entscheid-Kommentar, kein PUT, kein verify", not g.puts and st3["issues"]["740"]["grund"]=="widerruf" and any(m.marker("entscheid",740) in c["body"] for c in g.comments.get(740, [])))
 
 # S40 Größenwarnung: rc 3 + ein Signal je 24 h; kein Signal im Trockenlauf

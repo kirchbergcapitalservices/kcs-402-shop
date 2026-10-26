@@ -245,9 +245,16 @@ check("S29 erster Kontakt: gesehen mit seit, wartet", st["issues"]["120"]["state
 st["issues"]["120"]["seit"] = int(_t.time()) - m.GESEHEN_MAX_S - 1; m.handle_paid(st, net, "sepolia", iss, False)
 check("S29b nach Frist: abgelehnt mit Grund frist, Kommentar, Hash nicht verbraucht", st["issues"]["120"]["state"]=="abgelehnt" and st["issues"]["120"].get("grund")=="frist" and len(g.posts())==1 and "0x"+"ff"*32 not in st["used_hashes"] and "neue Zahlung" in g.comments[120][0]["body"])
 check("S29b2 Frist-Ablehnung ist offenes Gate", m.offene_gates(st)==[120])
-m.save_state(st, False); sys.argv=["kcs402_check.py","--gate-erledigt","120"]; rc=m.main(); st=m.load_state()
-check("S29b3 --gate-erledigt schließt das Gate, Zustand bleibt abgelehnt/frist", rc==0 and st["issues"]["120"].get("erledigt") is True and st["issues"]["120"]["grund"]=="frist" and m.offene_gates(st)==[])
-sys.argv=["kcs402_check.py","--gate-erledigt","999"]; rc=m.main(); check("S29b4 --gate-erledigt ohne Frist-Fall: nichts, rc 0", rc==0)
+m.save_state(st, False)
+try:
+    sys.argv=["kcs402_check.py","--gate-erledigt","120"]; m.main(); check("S29b3a --gate-erledigt ohne --befund wird abgewiesen", False)
+except SystemExit as e:
+    check("S29b3a --gate-erledigt ohne --befund wird abgewiesen", e.code==2)
+sys.argv=["kcs402_check.py","--gate-erledigt","120","--befund","nicht-gefunden"]; rc=m.main(); st=m.load_state(); erl=st["issues"]["120"].get("erledigt")
+check("S29b3 --gate-erledigt --befund: Datensatz mit Zeit + Befund, Gate zu, Zustand bleibt", rc==0 and isinstance(erl, dict) and erl["befund"]=="nicht-gefunden" and erl["at"]>0 and st["issues"]["120"]["grund"]=="frist" and m.offene_gates(st)==[])
+sys.argv=["kcs402_check.py","--gate-erledigt","999","--befund","gefunden"]; rc=m.main(); check("S29b4 --gate-erledigt ohne Frist-Fall: nichts, rc 0", rc==0)
+st["issues"]["123"]={"state":"abgelehnt","login":"bob","tx":"","grund":"frist","erledigt":True}; m.save_state(st, False); st=m.load_state()
+check("S29b6 Altformat erledigt=True → Datensatz unbekannt, kein Gate", st["issues"]["123"]["erledigt"]=={"at":0,"befund":"unbekannt"} and 123 not in m.offene_gates(st))
 st["issues"]["122"]={"state":"abgelehnt","login":"bob","tx":""}; check("S29b5 gewöhnliche Ablehnung ist kein Gate", m.offene_gates(st)==[])
 g = FakeGH(); m.gh = g; st = m.empty_state(); st["issues"]["121"]={"state":"gesehen","login":"bob","tx":"0x"+"ab"*32,"seit": int(_t.time()) - m.GESEHEN_MAX_S - 1}
 m.verify_payment = lambda net, tx, num, created: ("pending", "low_conf", "nur 2 Bestätigungen", 0)
@@ -268,6 +275,65 @@ for n in (140,141,142): st["issues"][str(n)]={"state":"gesehen","login":"bob","t
 mk=lambda n,kind,tx=None,closed=False: {"number":n,"created":float(n),"login":"bob","kind":kind,"tx":tx,"closed":closed}
 plan={i["number"]:a for i,a in m.build_plan([mk(140,"paid","0x"+"8c"*32), mk(141,"paid","0x"+"8d"*32), mk(142,"paid","0x"+"8e"*32), mk(143,"paid","0x"+"8f"*32)], st)}
 check("S31 drei gesehen + 4. paid → excess", plan.get(143)=="excess" and all(plan.get(n)=="process" for n in (140,141,142)), str(plan))
+
+# FakeGH2: GitHub-Modell mit Issue-Liste, Kommentaren, Collaborator-PUT — für Ketten über main()
+class FakeGH2(FakeGH):
+    def __init__(self):
+        super().__init__(); self.issues={}; self.invited=set(); self.puts=[]
+    def __call__(self, path, method=None, fields=None, allow_404=False, timeout=60):
+        self.calls.append((method or "GET", path))
+        if path == "user": return {"login": "kirchbergcapital"}
+        if path.endswith("/collaborators/" + path.split("/collaborators/")[-1]) and "/collaborators/" in path:
+            login = path.split("/collaborators/")[1].split("/")[0]
+            if path.endswith("/permission"):
+                return {"permission": "pull"} if login in self.invited else None
+            if method == "PUT":
+                self.invited.add(login); self.puts.append(login); return None
+        if path.endswith("/issues"):
+            want = (fields or {}).get("state", "open")
+            return [dict(i) for i in self.issues.values() if i["state"] == want]
+        num = int(path.split("/issues/")[1].split("/")[0])
+        if path.endswith("/comments"):
+            self.calls.pop()  # FakeGH zählt den Aufruf selbst
+            return super().__call__(path, method, fields, allow_404, timeout)
+        if method == "PATCH":
+            self.issues[num]["state"] = "closed"; self.issues[num]["updated_at"] = "2026-10-26T07:00:00Z"; return None
+        return dict(self.issues[num]) if num in self.issues else None
+    def add(self, num, title, login="bob"):
+        self.issues[num] = {"number": num, "title": title, "state": "open", "created_at": "2026-10-26T06:00:00Z", "updated_at": "2026-10-26T06:00:00Z", "user": {"login": login}}
+
+TX = lambda n: "0x" + ("%02x" % (n % 256)) * 32  # 64 Hexzeichen, auch für Nummern ≥ 256
+# S32 Kette grant → Kommentar-POST scheitert (unklar) → reorg_watch ok: kein zweiter POST, kein zweiter PUT → Freigabe → Abschluss
+g = FakeGH2(); g.post_mode="fail"; m.gh = g; st = m.empty_state(); net=("https://x", "0x"+"01"*20, 100000)
+iss = {"number": 200, "created": 1.0, "login": "bob", "kind": "paid", "tx": TX(200), "closed": False}
+st["issues"]["200"]={"state":"geprüft","login":"bob","tx":TX(200),"paid_units":100200,"invite_started":False}; g.add(200, "paid:"+TX(200))
+m.grant(st, "sepolia", iss, TX(200), 100200, False)
+check("S32 grant: ein PUT, eingeladen, Hash gebunden, Abschluss unklar", g.puts==["bob"] and st["issues"]["200"]["state"]=="eingeladen" and st["used_hashes"][TX(200)]["state"]=="eingeladen" and st["issues"]["200"]["abschluss"]=="unklar" and len(g.posts())==1)
+g.post_mode="ok"; m.verify_payment = lambda net, tx, num, created: ("ok", "ok", "ok", 100200)
+m.reorg_watch(st, net, iss, st["issues"]["200"], False)
+check("S32b reorg_watch ok bei unklar: kein POST, kein PUT, kein PATCH, Gate bleibt", len(g.posts())==1 and g.puts==["bob"] and not g.patches() and st["issues"]["200"]["abschluss"]=="unklar" and m.offene_gates(st)==[200])
+m.save_state(st, False); sys.argv=["kcs402_check.py","--kommentar-freigeben","200"]; m.main(); st=m.load_state()
+m.reorg_watch(st, net, iss, st["issues"]["200"], False)
+check("S32c nach Freigabe: genau ein weiterer POST + PATCH, geschlossen, weiterhin ein PUT", len(g.posts())==2 and len(g.patches())==1 and st["issues"]["200"]["abschluss"]=="geschlossen" and g.puts==["bob"])
+
+# S33 Kette excess → Nachversöhnung → Einladung (K2 R3 Probe A als Szenario)
+g = FakeGH2(); m.gh = g; st = m.empty_state()
+for n in (301,302,303):
+    g.add(n, "paid:"+TX(n)); st["issues"][str(n)]={"state":"gesehen","login":"bob","tx":TX(n),"seit":int(_t.time())}
+g.add(304, "paid:"+TX(304)); m.save_state(st, False)
+m.verify_payment = lambda net, tx, num, created: ("ok","ok","ok",100304) if num==304 else ("pending","not_found","noch nicht gefunden",0)
+sys.argv=["kcs402_check.py","--network","sepolia"]; rc1=m.main(); st1=m.load_state()
+check("S33 Lauf 1: #304 excess → geschlossen (ephemer), kein PUT, #301–303 bleiben gesehen", rc1==0 and g.issues[304]["state"]=="closed" and not g.puts and st1["ephemer"].get("304",{}).get("kommentar")=="geschlossen" and all(st1["issues"][str(n)]["state"]=="gesehen" for n in (301,302,303)))
+rc2=m.main(); st2=m.load_state()
+check("S33b Lauf 2: Nachversöhnung lädt #304 ein (ein PUT), Hash gebunden, kein Zweitkommentar", rc2==0 and g.puts==["bob"] and st2["issues"]["304"]["state"]=="eingeladen" and st2["used_hashes"][TX(304)]["issue"]==304 and len([c for c in g.posts() if c[1].endswith("/304/comments")])==1)
+rc3=m.main(); check("S33c Lauf 3: idempotent, kein weiterer PUT", rc3==0 and g.puts==["bob"])
+
+# S34 Gate-Text nennt Art je Issue
+g = FakeGH2(); m.gh = g; st = m.empty_state()
+st["issues"]["400"]={"state":"widerruf-offen","login":"bob","tx":TX(400)}; st["issues"]["401"]={"state":"eingeladen","login":"bob","tx":TX(401),"abschluss":"unklar"}
+st["issues"]["402"]={"state":"abgelehnt","login":"bob","tx":"","grund":"frist"}; st["ephemer"]["403"]={"kommentar":"post-gestartet"}; m.save_state(st, False)
+texte=[]; m.signal_mensch = lambda t: (texte.append(t), True)[1]; sys.argv=["kcs402_check.py","--network","sepolia"]; rc=m.main()
+check("S34 Signaltext mit Art je Issue", rc==2 and len(texte)==1 and all(x in texte[0] for x in ("#400 (widerruf-offen)", "#401 (abschluss-unklar)", "#402 (frist-ablehnung)", "#403 (ephemer-post-gestartet)", "--gate-erledigt")), texte[0][:200] if texte else "")
 
 # S11 Marker-Suche erkennt Pagination-Grenze als Fehler (nicht als 'kein Marker')
 g = FakeGH(); m.gh = g; g.comments[11] = [{"id": i, "body": "x"} for i in range(100*m.MAX_PAGES + 1)]

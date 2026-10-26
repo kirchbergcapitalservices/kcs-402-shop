@@ -45,6 +45,7 @@ KOMMENTAR_FELD = {"abschluss": "abschluss", "widerruf": "widerruf_kommentar", "e
 # "ephemer" (Fremdtitel/Überzahl ohne Vorgang) liegt in st["ephemer"][<nr>] = {"kommentar": <zustand>}, nicht in issues
 # (dort verlangt load_state einen Vorgangszustand). Review Grok/vibe 25.10.: close_ephemeral durch denselben Automaten.
 KOMMENTAR_ZUSTAENDE = {"post-gestartet", "kommentiert", "geschlossen", "unklar"}
+BEFUNDE = {"gefunden", "nicht-gefunden", "unbekannt"}  # --gate-erledigt --befund (K2 R4 P3): Ergebnis der Inhaber-Prüfung auf der Kette
 PERMS = {"admin", "maintain", "write", "triage", "read"}
 HEX64 = re.compile(r"^0x[0-9a-fA-F]{64}$")
 HEXQ = re.compile(r"^0x[0-9a-fA-F]{1,64}$")
@@ -197,8 +198,11 @@ def load_state():
             item["seit"] = val["seit"]
         if val.get("grund") == "frist":  # K2 R3 P2: Frist-Ablehnung bleibt Menschen-Gate, bis der Inhaber sie erledigt
             item["grund"] = "frist"
-        if val.get("erledigt") is True:
-            item["erledigt"] = True
+        erl = val.get("erledigt")
+        if erl is True:  # Altformat (26.10. vormittags): ohne Zeitpunkt und Befund
+            item["erledigt"] = {"at": 0, "befund": "unbekannt"}
+        elif isinstance(erl, dict) and isinstance(erl.get("at"), int) and erl["at"] >= 0 and erl.get("befund") in BEFUNDE:
+            item["erledigt"] = {"at": erl["at"], "befund": erl["befund"]}
         st["issues"][key] = item
     for inv in raw_v:
         need(isinstance(inv, dict) and isinstance(inv.get("issue"), int), "invite")
@@ -865,6 +869,28 @@ def dispatch(st, net, net_name, iss, action, dry):
     handle_paid(st, net, net_name, iss, dry)
 
 
+def gate_arten(st):
+    """{Issue-Nr: [Arten]} der offenen Menschen-Gates — für den Signaltext (K2 R4 P3: Art je Issue statt Nachsehen im State)."""
+    wartend = {"unklar", "post-gestartet"}
+    arten = {}
+    for k, v in st["issues"].items():
+        a = []
+        if v.get("state") == "widerruf-offen":
+            a.append("widerruf-offen")
+        if v.get("abschluss") in wartend:
+            a.append(f"abschluss-{v['abschluss']}")
+        if v.get("widerruf_kommentar") in wartend:
+            a.append(f"widerruf-kommentar-{v['widerruf_kommentar']}")
+        if v.get("state") == "abgelehnt" and v.get("grund") == "frist" and not v.get("erledigt"):
+            a.append("frist-ablehnung")
+        if a:
+            arten[int(k)] = a
+    for k, v in st.get("ephemer", {}).items():
+        if v.get("kommentar") in wartend:
+            arten.setdefault(int(k), []).append(f"ephemer-{v['kommentar']}")
+    return arten
+
+
 def offene_gates(st):
     """Vorgänge, die auf den Inhaber warten: widerruf-offen oder ein Kommentar im Zustand unklar (Review K2 P2)."""
     wartend = {"unklar", "post-gestartet"}  # Review Grok R4: post-gestartet außerhalb des Fensters bleibt sonst stumm
@@ -913,6 +939,8 @@ def main():
     ap.add_argument("--once-issue", type=int, default=None)
     ap.add_argument("--gate-erledigt", type=int, default=None, metavar="ISSUE",
                     help="Menschen-Gate (K2 R3 P2): Frist-Ablehnung nach Prüfung des Inhabers (Zahlung on-chain nachgesehen) als erledigt markieren; sonst kein Lauf")
+    ap.add_argument("--befund", choices=sorted(BEFUNDE - {"unbekannt"}), default=None,
+                    help="zu --gate-erledigt: Ergebnis der Inhaber-Prüfung auf der Kette (gefunden = Zugang von Hand vergeben)")
     ap.add_argument("--kommentar-freigeben", type=int, default=None, metavar="ISSUE",
                     help="Menschen-Gate (Astra R7 P2): nach manueller Prüfung, dass kein Kommentar existiert, einen neuen Versuch erlauben; sonst kein Lauf")
     args = ap.parse_args()
@@ -922,6 +950,10 @@ def main():
         ap.error("--kommentar-freigeben außerhalb 1..99999999")
     if args.gate_erledigt is not None and not 1 <= args.gate_erledigt <= 99_999_999:
         ap.error("--gate-erledigt außerhalb 1..99999999")
+    if args.gate_erledigt is not None and args.befund is None:
+        ap.error("--gate-erledigt braucht --befund gefunden|nicht-gefunden")
+    if args.befund is not None and args.gate_erledigt is None:
+        ap.error("--befund nur zusammen mit --gate-erledigt")
     args.network = NET_ALIASES[args.network.lower()]
     net = NETS[args.network]
     need(net[0].startswith("https://") and ADDR.fullmatch(net[1]) and isinstance(net[2], int) and net[2] > 0, "netz")
@@ -936,10 +968,10 @@ def main():
         if args.gate_erledigt is not None:  # K2 R3 P2: Inhaber-Entscheid zur Frist-Ablehnung, kein regulärer Lauf
             rec = st["issues"].get(str(args.gate_erledigt)) or {}
             if rec.get("state") == "abgelehnt" and rec.get("grund") == "frist" and not rec.get("erledigt"):
-                rec["erledigt"] = True
+                rec["erledigt"] = {"at": int(time.time()), "befund": args.befund}  # K2 R4 P3: Zeitpunkt + Prüfergebnis
                 if not args.dry_run:
                     save_state(st, False)
-                log(f"#{args.gate_erledigt} Frist-Ablehnung als erledigt markiert (dry={args.dry_run})")
+                log(f"#{args.gate_erledigt} Frist-Ablehnung als erledigt markiert: Befund {args.befund} (dry={args.dry_run})")
             else:
                 log(f"#{args.gate_erledigt} keine offene Frist-Ablehnung")
             return 0
@@ -986,7 +1018,10 @@ def main():
             save_state(st, False)
         gates = offene_gates(st)  # Review K2 P2: ein hängender Vorgang darf im Cron nicht stumm bleiben
         if gates:
-            text = f"MENSCHEN-GATE offen: {len(gates)} Vorgang/Vorgänge, Issues {', '.join('#' + str(n) for n in gates)} (widerruf-offen, Kommentar unklar oder Frist-Ablehnung) — Entscheid des Inhabers nötig"
+            arten = gate_arten(st)
+            text = ("MENSCHEN-GATE offen: " + f"{len(gates)} Vorgang/Vorgänge — "
+                    + "; ".join(f"#{n} ({', '.join(arten.get(n, ['?']))})" for n in gates)
+                    + " — Entscheid des Inhabers nötig (--kommentar-freigeben / --gate-erledigt --befund)")
             log(text)
             if not args.dry_run and signal_faellig(st, gates) and signal_mensch(text):
                 signal_merken(st, gates)

@@ -493,11 +493,33 @@ g = FakeGH2(); m.gh = g; st = m.empty_state(); g.add(700, "paid:"+TX(700)); st["
 sys.argv=["kcs402_check.py","--gate-erledigt","700","--befund","gefunden"]; rc=m.main(); st3=m.load_state()
 check("S45 Widerruf entschieden: abgelehnt/widerruf, Gate zu, Hash abgelehnt", rc==0 and st3["issues"]["700"]["state"]=="abgelehnt" and st3["issues"]["700"]["grund"]=="widerruf" and 700 not in m.offene_gates(st3) and st3["used_hashes"][TX(700)]["state"]=="abgelehnt")
 m.verify_payment = lambda net, tx, num, created: ("ok","ok","ok",100700); sys.argv=["kcs402_check.py","--network","sepolia"]; rc=m.main()
-check("S45b Folgelauf: Issue geschlossen mit Inhaber-Text, kein PUT, rc 0", rc==0 and not g.puts and any("vom Inhaber entschieden" in c["body"] for c in g.comments.get(700, [])) and g.issues[700]["state"]=="closed")
+check("S45b Folgelauf: Issue geschlossen mit Entscheid-Kommentar (eigene Art), kein PUT, rc 0", rc==0 and not g.puts and any("Vorgang vom Inhaber entschieden: Zahlung bestätigt" in c["body"] and m.marker("entscheid",700) in c["body"] for c in g.comments.get(700, [])) and g.issues[700]["state"]=="closed")
 
 # S46 ephemer kommentiert bei geschlossenem Issue wird bereinigt
 st = m.empty_state(); st["ephemer"]["710"]={"kommentar":"kommentiert"}; st["ephemer"]["711"]={"kommentar":"kommentiert"}
-weg = m.bereinigen(st, {"711"}); check("S46 ephemer kommentiert: zu → weg, offen → bleibt", "710" not in st["ephemer"] and "711" in st["ephemer"])
+weg = m.bereinigen(st, {"711"}); check("S46 ephemer kommentiert bleibt immer (Grok R16: sonst Zweitkommentar nach Wiederöffnen)", "710" in st["ephemer"] and "711" in st["ephemer"])
+
+# S47 K2 Probe M3: gesehen + Bindung geprüft (gleiches Issue) → keine neue Reservierung, kein PUT, Menschen-Gate
+g = FakeGH2(); m.gh = g; st = m.empty_state(); g.add(720, "paid:"+TX(720)); st["issues"]["720"]={"state":"gesehen","login":"bob","tx":TX(720),"seit":int(_t.time())}; m.bind_hash(st, TX(720), 720, "bob", "geprüft"); m.save_state(st, False)
+m.verify_payment = lambda net, tx, num, created: ("ok","ok","ok",100720); sys.argv=["kcs402_check.py","--network","sepolia"]; rc=m.main(); st3=m.load_state()
+check("S47 gesehen + Bindung geprüft: kein PUT, widerruf-offen", not g.puts and st3["issues"]["720"]["state"]=="widerruf-offen", str((g.puts, st3["issues"]["720"]["state"])))
+
+# S48 K2 Probe Q3: Reorg-Widerruf nach Einladung (abschluss geschlossen, Issue wieder offen) → --gate-erledigt → Entscheid-Kommentar trotz vorhandenem Abschluss-Marker, dann geschlossen
+g = FakeGH2(); m.gh = g; st = m.empty_state(); g.add(730, "paid:"+TX(730)); g.comments[730]=[{"id":1,"body":"alt "+m.marker("abschluss",730),"user":{"login":"kirchbergcapital"}}]
+st["issues"]["730"]={"state":"widerruf-offen","login":"bob","tx":TX(730),"abschluss":"geschlossen","notified":True}; m.bind_hash(st, TX(730), 730, "bob", "widerruf-offen"); m.save_state(st, False)
+sys.argv=["kcs402_check.py","--gate-erledigt","730","--befund","nicht-gefunden"]; m.main(); sys.argv=["kcs402_check.py","--network","sepolia"]; rc=m.main(); st3=m.load_state()
+check("S48 Entscheid-Kommentar trotz Abschluss-Marker, geschlossen, kein PUT", rc==0 and not g.puts and any("nicht bestätigt, kein Zugang" in c["body"] for c in g.comments[730]) and g.issues[730]["state"]=="closed" and st3["issues"]["730"]["entscheid_kommentar"]=="geschlossen")
+n=len(g.posts()); rc=m.main(); check("S48b Folgelauf: kein weiterer Kommentar", len(g.posts())==n)
+
+# S49 Befund-Korrektur beim entschiedenen Widerruf
+sys.argv=["kcs402_check.py","--gate-erledigt","730","--befund","gefunden"]; rc=m.main(); st3=m.load_state()
+check("S49 Widerruf-Befund korrigiert, Zustand bleibt abgelehnt/widerruf", rc==0 and st3["issues"]["730"]["erledigt"]["befund"]=="gefunden" and st3["issues"]["730"]["state"]=="abgelehnt" and st3["issues"]["730"]["grund"]=="widerruf")
+
+# S50 grund wandert mit der Bindung: Rekonstruktion eines abgelehnt/widerruf ohne Vorgang behält den Entscheid-Pfad
+st = m.empty_state(); m.bind_hash(st, TX(740), 740, "bob", "abgelehnt", grund="widerruf"); m.save_state(st, False); st2=m.load_state()
+check("S50 grund im used_hashes-Roundtrip", st2["used_hashes"][TX(740)].get("grund")=="widerruf")
+g = FakeGH2(); m.gh = g; g.add(740, "paid:"+TX(740)); rc=m.main(); st3=m.load_state()
+check("S50b Rekonstruktion abgelehnt/widerruf: Entscheid-Kommentar, kein PUT, kein verify", not g.puts and st3["issues"]["740"]["grund"]=="widerruf" and any(m.marker("entscheid",740) in c["body"] for c in g.comments.get(740, [])))
 
 # S40 Größenwarnung: rc 3 + ein Signal je 24 h; kein Signal im Trockenlauf
 g = FakeGH2(); m.gh = g; st = m.empty_state(); m.save_state(st, False); alt_warn = m.STATE_WARN_BYTES; m.STATE_WARN_BYTES = 10

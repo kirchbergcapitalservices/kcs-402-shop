@@ -386,7 +386,7 @@ g = FakeGH2(); m.gh = g; st = m.empty_state(); g.add(530, "paid:"+TX(530)); st["
 m.verify_payment = lambda net, tx, num, created: ("pending","not_found","x",0)
 m.handle_paid(st, net, "sepolia", {"number":530,"created":1.0,"login":"bob","kind":"paid","tx":TX(530),"closed":False}, False)
 check("S38 ephemer unklar → ersetzt, kein Gate mehr aus ephemer", st["ephemer"]["530"]["kommentar"]=="ersetzt" and 530 not in m.offene_gates(st))
-weg = m.bereinigen(st, {"530"}); check("S38b Bereinigung entfernt ersetzt auch bei offenem Issue", "530" not in st["ephemer"] and weg["ephemer"]==1)
+weg = m.bereinigen(st, {"530"}); check("S38b Bereinigung entfernt ersetzt auch bei offenem Issue", "530" not in st["ephemer"] and weg["ephemer"]==1 and "issues" not in weg)
 
 # S39 Bereinigung: alte Einladungen, abgeschlossene Vorgänge geschlossener Issues; used_hashes bleiben; Offenes/Wartendes bleibt
 st = m.empty_state(); now=int(_t.time()); alt=_t.strftime("%Y-%m-%d", _t.gmtime(now-5*86400)); heute=_t.strftime("%Y-%m-%d", _t.gmtime(now))
@@ -401,7 +401,7 @@ st["issues"]["606"]={"state":"gesehen","login":"bob","tx":TX(606),"seit":now}
 st["issues"]["607"]={"state":"eingeladen","login":"bob","tx":TX(607),"abschluss":"geschlossen","seit":now-m.REORG_WACHE_S-10}  # offen gelistet
 for n in (600,601,605,606,607): m.bind_hash(st, TX(n), n, "bob", st["issues"][str(n)]["state"])
 weg = m.bereinigen(st, {"607"})
-check("S39 Vorgänge werden NIE gelöscht (Sicherheits-Review 26.10. HIGH): alle acht bleiben", sorted(st["issues"])==["600","601","602","603","604","605","606","607"] and weg["issues"]==0, str(sorted(st["issues"])))
+check("S39 Vorgänge werden NIE gelöscht (Sicherheits-Review 26.10. HIGH): alle acht bleiben", sorted(st["issues"])==["600","601","602","603","604","605","606","607"] and "issues" not in weg, str(sorted(st["issues"])))
 check("S39b used_hashes vollständig, alte Einladung weg, heutige bleibt", len(st["used_hashes"])==5 and st["used_hashes"][TX(600)]["issue"]==600 and [i["issue"] for i in st["invites"]]==[601] and weg["invites"]==1)
 # Wiederanlauf eines bereinigten eingeladenen Issues: Marker verhindert Zweitkommentar, kein zweiter PUT
 g = FakeGH2(); m.gh = g; g.add(600, "paid:"+TX(600)); g.comments[600]=[{"id":1,"body":"alt "+m.marker("abschluss",600),"user":{"login":"kirchbergcapital"}}]; g.invited.add("bob")
@@ -429,6 +429,29 @@ check("S39f geprüft rekonstruiert: kein PUT, widerruf-offen, rc 2", not g.puts 
 g = FakeGH2(); m.gh = g; g.add(630, "paid:"+TX(630)); st = m.empty_state(); st["ephemer"]["630"]={"kommentar":"ersetzt"}
 m.close_ephemeral(st, 630, "x", False); r = m.comment_once(st, 630, "ephemer", "x")
 check("S38c ersetzt: kein POST, kein PATCH, comment_once False", not g.posts() and not g.patches() and r is False and st["ephemer"]["630"]["kommentar"]=="ersetzt")
+
+# S39g K2 Probe H: eingeladen OHNE tx (Altbestand/Handarbeit), Issue zu, im Fenster, Zugang entzogen → kein PUT
+g = FakeGH2(); m.gh = g; st = m.empty_state(); st["issues"]["640"]={"state":"eingeladen","login":"bob","tx":""}; st["last_ok"]=int(_t.time()); m.save_state(st, False)
+g.add(640, "paid:"+TX(640)); g.issues[640]["state"]="closed"; g.issues[640]["updated_at"]=_t.strftime("%Y-%m-%dT%H:%M:%SZ", _t.gmtime())
+m.verify_payment = lambda net, tx, num, created: ("ok","ok","ok",100640); sys.argv=["kcs402_check.py","--network","sepolia"]; rc=m.main(); st3=m.load_state()
+check("S39g eingeladen ohne tx: kein PUT, Zustand bleibt eingeladen", not g.puts and st3["issues"]["640"]["state"]=="eingeladen", str(g.puts))
+
+# S41 Grok R12 P2: geprüft-Reservierung schwebt > 7 d → Menschen-Gate (widerruf-offen), kein PUT, Hash bleibt; frische Reservierung wartet weiter
+g = FakeGH2(); m.gh = g; st = m.empty_state(); g.add(650, "paid:"+TX(650))
+st["issues"]["650"]={"state":"geprüft","login":"bob","tx":TX(650),"paid_units":100650,"invite_started":False,"seit":int(_t.time())-m.GESEHEN_MAX_S-1}; m.bind_hash(st, TX(650), 650, "bob", "geprüft")
+m.verify_payment = lambda net, tx, num, created: ("pending","low_conf","nur 2 Bestätigungen",0)
+m.handle_paid(st, net, "sepolia", {"number":650,"created":1.0,"login":"bob","kind":"paid","tx":TX(650),"closed":False}, False)
+check("S41 alte Reservierung schwebend → widerruf-offen, kein PUT, Hash gebunden, Gate offen", st["issues"]["650"]["state"]=="widerruf-offen" and not g.puts and st["used_hashes"][TX(650)]["state"]=="widerruf-offen" and 650 in m.offene_gates(st))
+st["issues"]["651"]={"state":"geprüft","login":"bob","tx":TX(651),"paid_units":100651,"invite_started":False,"seit":int(_t.time())}; m.bind_hash(st, TX(651), 651, "bob", "geprüft"); g.add(651, "paid:"+TX(651))
+m.handle_paid(st, net, "sepolia", {"number":651,"created":1.0,"login":"bob","kind":"paid","tx":TX(651),"closed":False}, False)
+check("S41b frische Reservierung wartet weiter (geprüft)", st["issues"]["651"]["state"]=="geprüft" and not g.puts)
+# S41c neue Reservierung trägt seit
+g = FakeGH2(); m.gh = g; st = m.empty_state(); g.add(652, "paid:"+TX(652)); m.verify_payment = lambda net, tx, num, created: ("ok","ok","ok",100652) if False else ("pending","low_conf","x",0)
+calls=[0]
+def vp(net, tx, num, created):
+    calls[0]+=1; return ("ok","ok","ok",100652) if calls[0]==1 else ("pending","low_conf","x",0)
+m.verify_payment = vp; m.handle_paid(st, net, "sepolia", {"number":652,"created":1.0,"login":"bob","kind":"paid","tx":TX(652),"closed":False}, False)
+check("S41c Reservierung bekommt seit, zweite Prüfung pending → wartet", st["issues"]["652"]["state"]=="geprüft" and st["issues"]["652"].get("seit",0)>0 and not g.puts)
 
 # S40 Größenwarnung: rc 3 + ein Signal je 24 h; kein Signal im Trockenlauf
 g = FakeGH2(); m.gh = g; st = m.empty_state(); m.save_state(st, False); alt_warn = m.STATE_WARN_BYTES; m.STATE_WARN_BYTES = 10

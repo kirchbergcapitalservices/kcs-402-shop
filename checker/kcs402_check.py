@@ -173,7 +173,7 @@ def load_state():
         raise RuntimeError("state.json unlesbar") from exc
     need(isinstance(data, dict), "state")
     raw_h, raw_i, raw_v = data.get("used_hashes", {}), data.get("issues", {}), data.get("invites", [])
-    if isinstance(data.get("last_ok"), (int, float)) and data["last_ok"] >= 0:
+    if isinstance(data.get("last_ok"), (int, float)) and not isinstance(data["last_ok"], bool) and data["last_ok"] >= 0:
         st["last_ok"] = int(data["last_ok"])  # Wasserstand des letzten erfolgreichen Laufs (Astra R4 P1)
     need(isinstance(raw_h, dict) and isinstance(raw_i, dict) and isinstance(raw_v, list), "state")
     for key, val in raw_h.items():
@@ -196,7 +196,7 @@ def load_state():
         for feld in KOMMENTAR_FELD.values():  # Astra R7 P2
             if val.get(feld) in KOMMENTAR_ZUSTAENDE:
                 item[feld] = val[feld]
-        if isinstance(val.get("paid_units"), int) and val["paid_units"] >= 0:
+        if isinstance(val.get("paid_units"), int) and not isinstance(val["paid_units"], bool) and val["paid_units"] >= 0:
             item["paid_units"] = val["paid_units"]
         if isinstance(val.get("seit"), int) and not isinstance(val["seit"], bool) and val["seit"] >= 0:  # Zeitpunkt von gesehen/eingeladen (K2 Bestand-P2)
             item["seit"] = val["seit"]
@@ -807,6 +807,18 @@ def handle_paid(st, net, net_name, iss, dry):
     if not login or not LOGIN_RE.fullmatch(login):
         log(f"#{num} Login fehlt, bleibt offen")
         return
+    # K2 R8 Probe H (allgemeiner Riegel): ein entschiedener Vorgang — gespeichert oder rekonstruiert, mit oder ohne tx —
+    # erreicht weder verify_payment noch grant(). dispatch leitet solche Sätze normalerweise vorher um; dies ist die zweite Wand.
+    if rec.get("state") == "eingeladen":
+        log(f"#{num} eingeladen ohne Reorg-Pfad (tx fehlt?) — kein PUT, nur Abschluss über Marker")
+        close_with_notice(st, num, f"Zugang besteht: @{login} ist read-only auf {WARE}.", dry)
+        return
+    if rec.get("state") == "abgelehnt":
+        close_with_notice(st, num, "Zahlung bereits abgelehnt. Kein Zugang.", dry)
+        return
+    if rec.get("state") == "widerruf-offen":
+        revoke(st, num, login, tx, "Widerruf wartet auf Entscheidung des Inhabers.", dry)
+        return
     if rec.get("state", "offen") == "offen" and not dry:
         # Astra R5 P1: Warteschlange — entdeckt, noch nicht abgeschlossen; KEINE Hash-Reservierung,
         # damit der Wasserstand diesen Vorgang nie überspringt.
@@ -846,7 +858,7 @@ def handle_paid(st, net, net_name, iss, dry):
             log(f"  [dry-run] würde @{login} einladen: {detail}")
             return
         st["issues"][str(num)] = {
-            "state": "geprüft", "login": login, "tx": tx, "paid_units": paid, "invite_started": False,
+            "state": "geprüft", "login": login, "tx": tx, "paid_units": paid, "invite_started": False, "seit": int(time.time()),
         }
         bind_hash(st, tx, num, login, "geprüft")
         save_state(st, False)  # Reservierung vor jedem PUT
@@ -858,6 +870,12 @@ def handle_paid(st, net, net_name, iss, dry):
         rec = st["issues"][str(num)]
     action = next_action(status, code, bool(rec.get("invite_started")))
     if action == "wait":
+        if int(time.time()) - int(rec.get("seit", time.time())) > GESEHEN_MAX_S:
+            # Grok R12 P2: eine Reservierung darf nicht ewig schweben (belegt einen Tagesplatz ohne Gate) → Menschen-Gate,
+            # Hash bleibt gebunden, kein PUT, kein DELETE; der Inhaber entscheidet.
+            log(f"#{num} Reservierung seit > {GESEHEN_MAX_S // 86_400} Tagen schwebend ({code}) — Menschen-Gate")
+            revoke(st, num, login, tx, f"Reservierung nach {GESEHEN_MAX_S // 86_400} Tagen nicht bestätigt ({code}).", dry)
+            return
         log(f"#{num} reserviert, wartet: {detail}")
         return
     if action == "deny":
@@ -962,7 +980,7 @@ def bereinigen(st, open_nums):
     eph_weg = [k for k, v in st.get("ephemer", {}).items() if v.get("kommentar") == "ersetzt" or (v.get("kommentar") == "geschlossen" and k not in open_nums)]
     for key in eph_weg:
         del st["ephemer"][key]
-    return {"invites": vorher - len(st["invites"]), "issues": 0, "ephemer": len(eph_weg)}
+    return {"invites": vorher - len(st["invites"]), "ephemer": len(eph_weg)}
 
 
 def groesse_pruefen(st, dry):
@@ -1084,7 +1102,7 @@ def main():
             open_nums = {str(r.get("number")) for r in loaded if isinstance(r, dict) and r.get("state") == "open" and isinstance(r.get("number"), int)}
             weg = bereinigen(st, open_nums)  # Josef 26.10.: Wachstum begrenzen, used_hashes bleiben
             if any(weg.values()):
-                log(f"bereinigt: {weg['issues']} Vorgänge, {weg['ephemer']} ephemer, {weg['invites']} alte Einladungen")
+                log(f"bereinigt: {weg['ephemer']} ephemer, {weg['invites']} alte Einladungen (Vorgänge und used_hashes bleiben)")
             st["last_ok"] = int(time.time())
             save_state(st, False)
         gross = groesse_pruefen(st, args.dry_run)

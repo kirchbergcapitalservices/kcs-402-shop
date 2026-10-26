@@ -822,7 +822,7 @@ def handle_paid(st, net, net_name, iss, dry):
             if int(time.time()) - seit > GESEHEN_MAX_S:
                 # K2 Bestand-P2 + Josef 26.10. (kein Restrisiko): JEDES über 7 Tage schwebende Ergebnis (not_found, not_canonical,
                 # log_removed, low_conf) wird Menschen-Gate statt ewig nachgeladen. Hash nicht verbrauchen (consume=False).
-                fail_issue(st, num, login, tx, f"Zahlung nach {GESEHEN_MAX_S // 86_400} Tagen nicht bestätigt ({code}). Kein Zugang. Für ein neues Issue ist eine neue Zahlung nötig; eine bereits geleistete Zahlung klärt der Inhaber.", dry, False, grund="frist")
+                fail_issue(st, num, login, tx, f"Zahlung nach {GESEHEN_MAX_S // 86_400} Tagen nicht bestätigt ({code}). Kein automatischer Zugang. Bitte keine zweite Zahlung senden: Der Inhaber prüft die bestehende Zahlung und meldet sich hier.", dry, False, grund="frist")
                 return
             log(f"#{num} wartet: {detail}")
             return
@@ -1072,7 +1072,8 @@ def main():
             except Exception as exc:
                 log(f"#{iss['number']} Fehler, übersprungen (bleibt offen, falls nicht schon persistiert): {exc}")
         if not args.dry_run and args.once_issue is None:  # Astra R5 P1: Einzel-Lauf verschiebt den Wasserstand nicht
-            open_nums = {str(i["number"]) for i in issues if not i.get("closed")}
+            # K2 R7 P3-5: offen = laut GitHub offen, auch wenn normalize() den Eintrag verworfen hat
+            open_nums = {str(r.get("number")) for r in loaded if isinstance(r, dict) and r.get("state") == "open" and isinstance(r.get("number"), int)}
             weg = bereinigen(st, open_nums)  # Josef 26.10.: Wachstum begrenzen, used_hashes bleiben
             if any(weg.values()):
                 log(f"bereinigt: {weg['issues']} Vorgänge, {weg['ephemer']} ephemer, {weg['invites']} alte Einladungen")
@@ -1084,7 +1085,8 @@ def main():
             arten = gate_arten(st)
             text = ("MENSCHEN-GATE offen: " + f"{len(gates)} Vorgang/Vorgänge — "
                     + "; ".join(f"#{n} ({', '.join(arten.get(n, ['?']))})" for n in gates)
-                    + " — Entscheid des Inhabers nötig (--kommentar-freigeben / --gate-erledigt --befund)")
+                    + " — Entscheid des Inhabers nötig (--kommentar-freigeben / --gate-erledigt --befund)"
+                    + (" | WARNUNG: state.json nahe der 5-MB-Grenze (rc 3 verdeckt durch rc 2)" if gross else ""))
             log(text)
             sig = signal_signatur(st, gates)
             if not args.dry_run and signal_faellig(st, sig) and signal_mensch(text):

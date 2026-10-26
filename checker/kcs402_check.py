@@ -216,7 +216,7 @@ def load_state():
     if isinstance(sig, dict) and isinstance(sig.get("gates"), list) and isinstance(sig.get("at"), int) \
             and not isinstance(sig["at"], bool) and sig["at"] >= 0:
         gates = [str(g) if isinstance(g, int) and not isinstance(g, bool) else g for g in sig["gates"]]  # Altformat: Nummern ohne Art
-        if all(isinstance(g, str) and SIGNAL_RE.fullmatch(g) or (isinstance(g, str) and ISSUE_KEY.fullmatch(g)) for g in gates):
+        if all(isinstance(g, str) and (SIGNAL_RE.fullmatch(g) or ISSUE_KEY.fullmatch(g)) for g in gates):
             st["signal"] = {"gates": gates, "at": sig["at"]}
     sga = data.get("signal_groesse_at")
     if isinstance(sga, int) and not isinstance(sga, bool) and sga >= 0:
@@ -577,6 +577,8 @@ def comment_once(st, num, kind, body):
     cur = rec.get(feld)
     if cur in ("kommentiert", "geschlossen"):
         return True
+    if cur == "ersetzt":  # Grok R11 P3: Issue ist in den Zahlungspfad gewechselt — hier nie mehr posten
+        return False
     if kind == "abschluss" and cur is None and rec.get("notified") and not rec.get("widerruf_kommentar"):  # Altformat vor R7 (Review K2 P3)
         rec[feld] = "kommentiert"
         save_state(st, False)
@@ -630,6 +632,8 @@ def close_ephemeral(st, num, comment, dry):
         log(f"  [dry-run] schlösse #{num}: {comment}")
         return
     rec = st.setdefault("ephemer", {}).setdefault(str(num), {})
+    if rec.get("kommentar") == "ersetzt":  # Grok R11 P3: Zahlungspfad hat übernommen — keine Außenaktion aus dem Überzahl-Pfad
+        return
     if rec.get("kommentar") == "geschlossen":  # Review Grok R2 P2: wiedereröffnet → nur schließen, kein neuer Kommentar
         if still_open(num):
             gh(f"repos/{SHOP}/issues/{num}", "PATCH", {"state": "closed"})
@@ -795,6 +799,10 @@ def handle_paid(st, net, net_name, iss, dry):
         if rec["state"] == "widerruf-offen":
             log(f"#{num} Vorgang aus used_hashes rekonstruiert (widerruf-offen) — Menschen-Gate bleibt")
             revoke(st, num, login, tx, "Widerruf wartet auf Entscheidung des Inhabers.", dry)
+            return
+        if rec["state"] == "geprüft":  # Grok R11: Reservierung ohne invite_started/pre_existing — ob der PUT lief, ist unbekannt
+            log(f"#{num} Vorgang aus used_hashes rekonstruiert (geprüft, Vorgangsdaten fehlen) — kein PUT, Inhaber prüft den Zugang")
+            revoke(st, num, login, tx, "Reservierung ohne Vorgangsdaten rekonstruiert; Zugang wird vom Inhaber geprüft.", dry)
             return
     if not login or not LOGIN_RE.fullmatch(login):
         log(f"#{num} Login fehlt, bleibt offen")

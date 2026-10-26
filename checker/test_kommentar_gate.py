@@ -420,6 +420,16 @@ g = FakeGH2(); m.gh = g; g.add(610, "paid:"+TX(610)); aufrufe=[]; m.verify_payme
 rc=m.main(); st3=m.load_state()
 check("S39e rekonstruiert als abgelehnt: verify nicht aufgerufen, kein PUT, Issue geschlossen mit Ablehnungs-Kommentar", not aufrufe and not g.puts and st3["issues"]["610"]["state"]=="abgelehnt" and len(g.patches())==1, str((aufrufe, g.puts)))
 
+# S39f rekonstruiertes geprüft (Reservierung, Vorgangsdaten fehlen): kein PUT, Menschen-Gate widerruf-offen
+st = m.empty_state(); m.bind_hash(st, TX(620), 620, "bob", "geprüft"); m.save_state(st, False)
+g = FakeGH2(); m.gh = g; g.add(620, "paid:"+TX(620)); m.verify_payment = lambda net, tx, num, created: ("ok","ok","ok",100620)
+sys.argv=["kcs402_check.py","--network","sepolia"]; sig=[]; m.signal_mensch = lambda t: (sig.append(t), True)[1]; rc=m.main(); st3=m.load_state()
+check("S39f geprüft rekonstruiert: kein PUT, widerruf-offen, rc 2", not g.puts and st3["issues"]["620"]["state"]=="widerruf-offen" and rc==2 and 620 in m.offene_gates(st3), str(g.puts))
+# S38c ersetzt ist Ende: close_ephemeral/comment_once auf ersetzt → keine Außenaktion
+g = FakeGH2(); m.gh = g; g.add(630, "paid:"+TX(630)); st = m.empty_state(); st["ephemer"]["630"]={"kommentar":"ersetzt"}
+m.close_ephemeral(st, 630, "x", False); r = m.comment_once(st, 630, "ephemer", "x")
+check("S38c ersetzt: kein POST, kein PATCH, comment_once False", not g.posts() and not g.patches() and r is False and st["ephemer"]["630"]["kommentar"]=="ersetzt")
+
 # S40 Größenwarnung: rc 3 + ein Signal je 24 h; kein Signal im Trockenlauf
 g = FakeGH2(); m.gh = g; st = m.empty_state(); m.save_state(st, False); alt_warn = m.STATE_WARN_BYTES; m.STATE_WARN_BYTES = 10
 sig=[]; m.signal_mensch = lambda t: (sig.append(t), True)[1]; sys.argv=["kcs402_check.py","--network","sepolia"]; rc1=m.main(); rc2=m.main()

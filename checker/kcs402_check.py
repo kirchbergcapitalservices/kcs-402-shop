@@ -59,6 +59,7 @@ STATE_DIR = Path.home() / ".local" / "state" / "kcs-402"
 MSG = {
     "foreign": "Geschlossen: Titel muss exakt 'claim' oder 'paid:' plus 0x und 64 Hexzeichen sein.",
     "excess": "Geschlossen: höchstens 3 offene Issues pro Autor.",
+    "excess_paid": "Geschlossen wegen Obergrenze (höchstens 3 offene Issues pro Autor). Die Zahlung wird trotzdem geprüft; bei gültiger Zahlung folgt der Zugang in einem späteren Lauf.",  # K2 R5 P3
     "bad_login": "Geschlossen: Issue-Autor ist kein gültiger GitHub-Login.",
 }
 
@@ -194,14 +195,14 @@ def load_state():
                 item[feld] = val[feld]
         if isinstance(val.get("paid_units"), int) and val["paid_units"] >= 0:
             item["paid_units"] = val["paid_units"]
-        if isinstance(val.get("seit"), int) and val["seit"] >= 0:  # Zeitpunkt von gesehen/eingeladen (K2 Bestand-P2)
+        if isinstance(val.get("seit"), int) and not isinstance(val["seit"], bool) and val["seit"] >= 0:  # Zeitpunkt von gesehen/eingeladen (K2 Bestand-P2)
             item["seit"] = val["seit"]
         if val.get("grund") == "frist":  # K2 R3 P2: Frist-Ablehnung bleibt Menschen-Gate, bis der Inhaber sie erledigt
             item["grund"] = "frist"
         erl = val.get("erledigt")
         if erl is True:  # Altformat (26.10. vormittags): ohne Zeitpunkt und Befund
             item["erledigt"] = {"at": 0, "befund": "unbekannt"}
-        elif isinstance(erl, dict) and isinstance(erl.get("at"), int) and erl["at"] >= 0 and erl.get("befund") in BEFUNDE:
+        elif isinstance(erl, dict) and isinstance(erl.get("at"), int) and not isinstance(erl["at"], bool) and erl["at"] >= 0 and erl.get("befund") in BEFUNDE:  # K2 R5: True ist kein Zeitpunkt
             item["erledigt"] = {"at": erl["at"], "befund": erl["befund"]}
         st["issues"][key] = item
     for inv in raw_v:
@@ -836,7 +837,8 @@ def handle_paid(st, net, net_name, iss, dry):
 def dispatch(st, net, net_name, iss, action, dry):
     num, price = iss["number"], net[2]
     if action in MSG:
-        close_ephemeral(st, num, MSG[action], dry)
+        text = MSG["excess_paid"] if action == "excess" and iss.get("kind") == "paid" else MSG[action]  # K2 R5 P3: ehrlich bei bezahltem Titel
+        close_ephemeral(st, num, text, dry)
         return
     rec = st["issues"].get(str(num)) or {}
     state, login = rec.get("state", "offen"), iss["login"]
@@ -892,13 +894,8 @@ def gate_arten(st):
 
 
 def offene_gates(st):
-    """Vorgänge, die auf den Inhaber warten: widerruf-offen oder ein Kommentar im Zustand unklar (Review K2 P2)."""
-    wartend = {"unklar", "post-gestartet"}  # Review Grok R4: post-gestartet außerhalb des Fensters bleibt sonst stumm
-    nums = {int(k) for k, v in st["issues"].items()
-            if v.get("state") == "widerruf-offen" or v.get("abschluss") in wartend or v.get("widerruf_kommentar") in wartend
-            or (v.get("state") == "abgelehnt" and v.get("grund") == "frist" and not v.get("erledigt"))}  # K2 R3 P2
-    nums |= {int(k) for k, v in st.get("ephemer", {}).items() if v.get("kommentar") in wartend}
-    return sorted(nums)
+    """Sortierte Issue-Nummern der offenen Menschen-Gates — dasselbe Prädikat wie gate_arten (K2 R5 P3)."""
+    return sorted(gate_arten(st))
 
 
 SIGNAL_WIEDERHOLUNG_S = 86_400  # Review Grok R4 P2: dasselbe offene Gate nicht in jedem Cron-Lauf erneut senden

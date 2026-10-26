@@ -206,6 +206,8 @@ except Exception as e:
 # S24 post-gestartet zählt als offenes Gate (Grok R4 P2)
 st = m.empty_state(); st["issues"]["80"]={"state":"eingeladen","login":"bob","tx":"0x"+"cc"*32,"abschluss":"post-gestartet"}; st["ephemer"]["81"]={"kommentar":"post-gestartet"}
 check("S24 post-gestartet in offene_gates", m.offene_gates(st)==[80,81], str(m.offene_gates(st)))
+st["issues"]["82"]={"state":"abgelehnt","login":"bob","tx":"","grund":"frist","erledigt":{"at":True,"befund":"gefunden"}}; m.save_state(st, False); st2=m.load_state()
+check("S24b erledigt.at=True ist kein Zeitpunkt → verworfen, Gate offen", "erledigt" not in st2["issues"]["82"] and 82 in m.offene_gates(st2))
 
 # S25 Dedupe: gleiches Gate → ein Signal in zwei Läufen; geänderte Menge → neues Signal; Zeitpunkt im State
 g = FakeGH(); m.gh = g; st = m.empty_state(); st["issues"]["90"]={"state":"eingeladen","login":"bob","tx":"0x"+"dd"*32,"abschluss":"unklar"}; m.save_state(st, False)
@@ -286,18 +288,18 @@ class FakeGH2(FakeGH):
         if path.endswith("/collaborators/" + path.split("/collaborators/")[-1]) and "/collaborators/" in path:
             login = path.split("/collaborators/")[1].split("/")[0]
             if path.endswith("/permission"):
-                return {"permission": "pull"} if login in self.invited else None
+                return {"permission": "read"} if login in self.invited else None  # echte API: read (pull steht nicht in PERMS)
             if method == "PUT":
                 self.invited.add(login); self.puts.append(login); return None
         if path.endswith("/issues"):
-            want = (fields or {}).get("state", "open")
-            return [dict(i) for i in self.issues.values() if i["state"] == want]
+            want = (fields or {}).get("state", "open"); since = (fields or {}).get("since")
+            return [dict(i) for i in self.issues.values() if i["state"] == want and (since is None or i["updated_at"] >= since)]  # K2 R5: since wie GitHub (updated_at)
         num = int(path.split("/issues/")[1].split("/")[0])
         if path.endswith("/comments"):
             self.calls.pop()  # FakeGH zählt den Aufruf selbst
             return super().__call__(path, method, fields, allow_404, timeout)
         if method == "PATCH":
-            self.issues[num]["state"] = "closed"; self.issues[num]["updated_at"] = "2026-10-26T07:00:00Z"; return None
+            self.issues[num]["state"] = "closed"; self.issues[num]["updated_at"] = _t.strftime("%Y-%m-%dT%H:%M:%SZ", _t.gmtime()); return None
         return dict(self.issues[num]) if num in self.issues else None
     def add(self, num, title, login="bob"):
         self.issues[num] = {"number": num, "title": title, "state": "open", "created_at": "2026-10-26T06:00:00Z", "updated_at": "2026-10-26T06:00:00Z", "user": {"login": login}}
@@ -327,6 +329,21 @@ check("S33 Lauf 1: #304 excess → geschlossen (ephemer), kein PUT, #301–303 b
 rc2=m.main(); st2=m.load_state()
 check("S33b Lauf 2: Nachversöhnung lädt #304 ein (ein PUT), Hash gebunden, kein Zweitkommentar", rc2==0 and g.puts==["bob"] and st2["issues"]["304"]["state"]=="eingeladen" and st2["used_hashes"][TX(304)]["issue"]==304 and len([c for c in g.posts() if c[1].endswith("/304/comments")])==1)
 rc3=m.main(); check("S33c Lauf 3: idempotent, kein weiterer PUT", rc3==0 and g.puts==["bob"])
+# S33d Negativfall: ein längst geschlossenes paid-Issue außerhalb des Fensters (updated_at alt) wird NICHT nachversöhnt
+g = FakeGH2(); m.gh = g; st = m.empty_state(); st["last_ok"] = int(_t.time()); m.save_state(st, False)
+g.add(305, "paid:"+TX(305)); g.issues[305]["state"]="closed"; g.issues[305]["updated_at"]="2026-01-01T00:00:00Z"
+m.verify_payment = lambda net, tx, num, created: ("ok","ok","ok",100305)
+rc=m.main(); check("S33d altes geschlossenes paid außerhalb des Fensters: kein PUT, kein Vorgang", rc==0 and not g.puts and "305" not in m.load_state()["issues"])
+g.issues[305]["updated_at"]=_t.strftime("%Y-%m-%dT%H:%M:%SZ", _t.gmtime()); rc=m.main()
+check("S33e frisch aktualisiert (im Fenster): wird nachversöhnt, ein PUT", rc==0 and g.puts==["bob"] and m.load_state()["issues"]["305"]["state"]=="eingeladen")
+# S33f Excess-Text bei paid ist ehrlich
+g = FakeGH2(); m.gh = g; st = m.empty_state()
+for n in (311,312,313):
+    g.add(n, "paid:"+TX(n)); st["issues"][str(n)]={"state":"gesehen","login":"bob","tx":TX(n),"seit":int(_t.time())}
+g.add(314, "paid:"+TX(314)); g.add(315, "claim"); m.save_state(st, False)
+m.verify_payment = lambda net, tx, num, created: ("pending","not_found","x",0); sys.argv=["kcs402_check.py","--network","sepolia"]; m.main()
+c314 = g.comments.get(314, [{}])[0].get("body",""); c315 = g.comments.get(315, [{}])[0].get("body","")
+check("S33f excess: paid-Titel bekommt Zahlungs-Hinweis, claim den kurzen Text", "Zahlung wird trotzdem geprüft" in c314 and c315.startswith("Geschlossen: höchstens 3"), (c314[:60], c315[:40]))
 
 # S34 Gate-Text nennt Art je Issue
 g = FakeGH2(); m.gh = g; st = m.empty_state()

@@ -31,6 +31,11 @@ NETS = {
 }
 MIN_CONF, CAP, MAX_OPEN, MAX_PAGES = 5, 10, 3, 200
 RECONCILE_H = 48  # Astra R3 P1: kürzlich geschlossene Claims nachversöhnen (Schließen/Broadcast-Race)
+# K2-Review R1 (Bestand-P2): Nachladen begrenzen. Ein gesehener paid-Vorgang, dessen Transaktion nach GESEHEN_MAX_S
+# immer noch nicht gefunden ist, wird abgelehnt (Issue bleibt dokumentiert, Hash nicht verbraucht); die Reorg-Wache
+# für Eingeladene endet nach REORG_WACHE_S (Base-Reorgs über Tage gibt es nicht; der Hash bleibt gebunden).
+GESEHEN_MAX_S = 7 * 86_400
+REORG_WACHE_S = 7 * 86_400
 NET_ALIASES = {"sepolia": "sepolia", "base-sepolia": "sepolia", "mainnet": "mainnet", "base": "mainnet", "base-mainnet": "mainnet"}
 STATES = {"offen", "gesehen", "geprüft", "eingeladen", "abgelehnt", "widerruf-offen"}
 # Astra R7 P2: Kommentar/Abschluss hat einen eigenen Zustand je Art. "post-gestartet" wird VOR dem POST gesichert;
@@ -188,6 +193,8 @@ def load_state():
                 item[feld] = val[feld]
         if isinstance(val.get("paid_units"), int) and val["paid_units"] >= 0:
             item["paid_units"] = val["paid_units"]
+        if isinstance(val.get("seit"), int) and val["seit"] >= 0:  # Zeitpunkt von gesehen/eingeladen (K2 Bestand-P2)
+            item["seit"] = val["seit"]
         st["issues"][key] = item
     for inv in raw_v:
         need(isinstance(inv, dict) and isinstance(inv.get("issue"), int), "invite")
@@ -307,6 +314,10 @@ def pending_from_state(st, loaded_numbers):
         if rec.get("state") not in ("gesehen", "geprüft", "widerruf-offen", "eingeladen"):
             continue
         num = int(key)
+        if rec.get("state") in ("gesehen", "eingeladen") and "seit" not in rec:
+            rec["seit"] = int(time.time())  # Altbestand ohne Zeitstempel: Frist beginnt jetzt (wird am Laufende gesichert)
+        if rec.get("state") == "eingeladen" and int(time.time()) - int(rec.get("seit", 0)) > REORG_WACHE_S:
+            continue  # K2 Bestand-P2: Reorg-Wache beendet; Hash bleibt gebunden, offen gelistete Issues laufen weiter über dispatch
         if num in loaded_numbers:
             continue
         try:
@@ -375,6 +386,8 @@ def build_plan(issues, st):
             iss["kind"], iss["tx"] = "paid", rec["tx"]
             iss["login"] = iss["login"] or stored_login(st, num, rec["tx"])
             if iss["login"]:
+                if rec.get("state") == "gesehen" and not iss.get("closed"):
+                    kept[iss["login"]] = kept.get(iss["login"], 0) + 1  # K2 Bestand-P2: unentschiedene gesehen-Issues zählen wie offene claims
                 plan.append((iss, "process"))
             continue
         if iss.get("closed"):
@@ -701,6 +714,7 @@ def grant(st, net_name, iss, tx, paid, dry):
     if not already:
         gh(f"repos/{WARE}/collaborators/{login}", "PUT", {"permission": "pull"})
     rec["state"] = "eingeladen"
+    rec["seit"] = int(time.time())  # Beginn der Reorg-Wache (K2 Bestand-P2)
     rec["paid_units"] = int(paid)
     rec["tx"] = tx
     bind_hash(st, tx, num, login, "eingeladen")
@@ -755,7 +769,7 @@ def handle_paid(st, net, net_name, iss, dry):
     if rec.get("state", "offen") == "offen" and not dry:
         # Astra R5 P1: Warteschlange — entdeckt, noch nicht abgeschlossen; KEINE Hash-Reservierung,
         # damit der Wasserstand diesen Vorgang nie überspringt.
-        st["issues"][str(num)] = {"state": "gesehen", "login": login, "tx": tx}
+        st["issues"][str(num)] = {"state": "gesehen", "login": login, "tx": tx, "seit": int(time.time())}
         save_state(st, False)
         rec = st["issues"][str(num)]
     try:
@@ -763,9 +777,15 @@ def handle_paid(st, net, net_name, iss, dry):
     except RpcError as exc:
         log(f"#{num} RPC-Fehler, bleibt offen: {exc}")
         return
-    state = (st["issues"].get(str(num)) or {}).get("state", "offen")
+    rec = st["issues"].get(str(num)) or {}
+    state = rec.get("state", "offen")
     if state in ("offen", "gesehen"):
         if status == "pending":
+            seit = int(rec.get("seit", time.time())) if state == "gesehen" else int(time.time())
+            if code == "not_found" and int(time.time()) - seit > GESEHEN_MAX_S:
+                # K2 Bestand-P2: nie gefundene Transaktion nicht ewig nachladen. Hash nicht verbrauchen (consume=False).
+                fail_issue(st, num, login, tx, f"Transaktion nach {GESEHEN_MAX_S // 86_400} Tagen nicht gefunden. Kein Zugang; bei Irrtum neues Issue mit gültigem Hash.", dry, False)
+                return
             log(f"#{num} wartet: {detail}")
             return
         if status != "ok":
@@ -852,13 +872,14 @@ SIGNAL_WIEDERHOLUNG_S = 86_400  # Review Grok R4 P2: dasselbe offene Gate nicht 
 
 
 def signal_faellig(st, gates):
-    """True, wenn sich die Menge geändert hat oder das letzte Signal älter als SIGNAL_WIEDERHOLUNG_S ist; merkt sich den Versand."""
+    """True, wenn sich die Menge geändert hat oder das letzte Signal älter als SIGNAL_WIEDERHOLUNG_S ist. Liest nur."""
     last = st.get("signal") or {}
-    now = int(time.time())
-    if last.get("gates") == gates and now - int(last.get("at", 0)) < SIGNAL_WIEDERHOLUNG_S:
-        return False
-    st["signal"] = {"gates": gates, "at": now}
-    return True
+    return not (last.get("gates") == gates and int(time.time()) - int(last.get("at", 0)) < SIGNAL_WIEDERHOLUNG_S)
+
+
+def signal_merken(st, gates):
+    """Grok R5 P2: erst nach erfolgreichem Versand merken, sonst bleibt der vorige Stand und der nächste Lauf versucht es erneut."""
+    st["signal"] = {"gates": gates, "at": int(time.time())}
 
 
 def signal_mensch(text):
@@ -866,13 +887,16 @@ def signal_mensch(text):
     exe = shutil.which("notify-telegram")
     if not exe:
         log("notify-telegram nicht vorhanden — Signal nur über rc 2")
-        return
+        return False
     try:
         proc = subprocess.run([exe, "-t", "kcs-402 Prüfer: Menschen-Gate", text[:900]], capture_output=True, text=True, timeout=30)
         if proc.returncode != 0:  # Review K2 N2
             log(f"notify-telegram rc={proc.returncode}: {(proc.stderr or '').strip()[:120]}")
+            return False
+        return True
     except Exception as exc:  # noqa: BLE001 — das Signal darf den Lauf nicht brechen
         log(f"notify-telegram fehlgeschlagen: {str(exc)[:120]}")
+        return False
 
 
 def main():
@@ -901,7 +925,8 @@ def main():
         if args.kommentar_freigeben is not None:  # Astra R7 P2: Inhaber-Entscheid, kein regulärer Lauf
             key = str(args.kommentar_freigeben)
             rec, eph = st["issues"].get(key) or {}, st.get("ephemer", {}).get(key) or {}
-            frei = [f for f in ("abschluss", "widerruf_kommentar") if rec.get(f) == "unklar"] + (["kommentar"] if eph.get("kommentar") == "unklar" else [])
+            wartend = ("unklar", "post-gestartet")  # Grok R5 P2: auch ein nie aufgelöster post-gestartet-Zustand
+            frei = [f for f in ("abschluss", "widerruf_kommentar") if rec.get(f) in wartend] + (["kommentar"] if eph.get("kommentar") in wartend else [])
             for f in frei:
                 (eph if f == "kommentar" else rec).pop(f, None)
             if frei and not args.dry_run:
@@ -942,11 +967,14 @@ def main():
         if gates:
             text = f"MENSCHEN-GATE offen: {len(gates)} Vorgang/Vorgänge, Issues {', '.join('#' + str(n) for n in gates)} (widerruf-offen oder Kommentar unklar) — Entscheid des Inhabers nötig"
             log(text)
-            if not args.dry_run and signal_faellig(st, gates):
-                signal_mensch(text)
+            if not args.dry_run and signal_faellig(st, gates) and signal_mensch(text):
+                signal_merken(st, gates)
                 save_state(st, False)  # Versandzeitpunkt sichern
             log("fertig (rc 2: Menschen-Gate offen)")
             return 2
+        if st.get("signal") and not args.dry_run:  # Grok R5 P2: leere Menge löscht das Signal-Gedächtnis
+            del st["signal"]
+            save_state(st, False)
         log("fertig")
         return 0
     finally:

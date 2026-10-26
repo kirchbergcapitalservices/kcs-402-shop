@@ -191,7 +191,7 @@ check("S21 widerruf + abschluss = zwei verschiedene Kommentare", len(g.posts())=
 
 # S22 Menschen-Gate-Signal: main endet mit rc 2 und ruft signal_mensch; ohne Gate rc 0
 g = FakeGH(); m.gh = g; st = m.empty_state(); st["issues"]["60"]={"state":"eingeladen","login":"bob","tx":"0x"+"bb"*32,"abschluss":"unklar"}; m.save_state(st, False)
-signale=[]; m.signal_mensch = lambda t: signale.append(t); sys.argv=["kcs402_check.py","--network","sepolia"]; rc=m.main()
+signale=[]; m.signal_mensch = lambda t: (signale.append(t), True)[1]; sys.argv=["kcs402_check.py","--network","sepolia"]; rc=m.main()
 check("S22 Gate offen → rc 2 + Signal mit Issue-Nummer", rc==2 and len(signale)==1 and "#60" in signale[0])
 signale.clear(); sys.argv=["kcs402_check.py","--network","sepolia","--dry-run"]; rc=m.main()
 check("S22b Trockenlauf: rc 2, aber kein Signal", rc==2 and not signale)
@@ -209,7 +209,7 @@ check("S24 post-gestartet in offene_gates", m.offene_gates(st)==[80,81], str(m.o
 
 # S25 Dedupe: gleiches Gate → ein Signal in zwei Läufen; geänderte Menge → neues Signal; Zeitpunkt im State
 g = FakeGH(); m.gh = g; st = m.empty_state(); st["issues"]["90"]={"state":"eingeladen","login":"bob","tx":"0x"+"dd"*32,"abschluss":"unklar"}; m.save_state(st, False)
-signale=[]; m.signal_mensch = lambda t: signale.append(t); sys.argv=["kcs402_check.py","--network","sepolia"]
+signale=[]; m.signal_mensch = lambda t: (signale.append(t), True)[1]; sys.argv=["kcs402_check.py","--network","sepolia"]
 rc1=m.main(); rc2=m.main()
 check("S25 zwei Läufe, gleiches Gate: rc 2 beide, genau ein Signal", rc1==2 and rc2==2 and len(signale)==1, str(len(signale)))
 st=m.load_state(); check("S25b Signal im State persistiert", st["signal"]["gates"]==[90] and st["signal"]["at"]>0)
@@ -217,6 +217,52 @@ st["ephemer"]["91"]={"kommentar":"unklar"}; m.save_state(st, False); rc3=m.main(
 check("S25c geänderte Menge → neues Signal", rc3==2 and len(signale)==2 and "#91" in signale[-1])
 st=m.load_state(); st["signal"]["at"]=0; m.save_state(st, False); m.main()
 check("S25d nach Ablauf der Frist erneut", len(signale)==3)
+
+# S26 Signal-Gedächtnis erst nach Versanderfolg (Grok R5 P2)
+g = FakeGH(); m.gh = g; st = m.empty_state(); st["issues"]["100"]={"state":"eingeladen","login":"bob","tx":"0x"+"ee"*32,"abschluss":"unklar"}; m.save_state(st, False)
+versuche=[]; m.signal_mensch = lambda t: (versuche.append(t), False)[1]; sys.argv=["kcs402_check.py","--network","sepolia"]
+rc=m.main(); rc=m.main(); st2=m.load_state()
+check("S26 Versand scheitert: kein Gedächtnis, jeder Lauf versucht erneut, rc 2", rc==2 and len(versuche)==2 and "signal" not in st2)
+m.signal_mensch = lambda t: (versuche.append(t), True)[1]; rc=m.main(); st2=m.load_state()
+check("S26b Versand gelingt: Gedächtnis gesetzt", st2.get("signal",{}).get("gates")==[100])
+
+# S27 leere Menge löscht das Signal-Gedächtnis
+st2["issues"]["100"]["abschluss"]="geschlossen"; m.save_state(st2, False); rc=m.main(); st3=m.load_state()
+check("S27 kein Gate mehr: rc 0, signal gelöscht", rc==0 and "signal" not in st3)
+
+# S28 Freigabe setzt auch post-gestartet zurück
+st = m.empty_state(); st["issues"]["110"]={"state":"abgelehnt","login":"bob","tx":"","abschluss":"post-gestartet"}; st["ephemer"]["111"]={"kommentar":"post-gestartet"}; m.save_state(st, False)
+sys.argv=["kcs402_check.py","--kommentar-freigeben","110"]; m.main(); sys.argv=["kcs402_check.py","--kommentar-freigeben","111"]; m.main(); st2=m.load_state()
+check("S28 Freigabe löscht post-gestartet (issues + ephemer)", "abschluss" not in st2["issues"]["110"] and "kommentar" not in st2["ephemer"].get("111", {}))
+
+# S29 gesehen + not_found: innerhalb der Frist wartet, nach der Frist abgelehnt ohne Hash-Verbrauch
+import time as _t
+g = FakeGH(); m.gh = g; st = m.empty_state(); net=("https://x", "0x"+"01"*20, 100000)
+m.verify_payment = lambda net, tx, num, created: ("pending", "not_found", "Transaktion noch nicht gefunden", 0)
+iss = {"number": 120, "created": 1.0, "login": "bob", "kind": "paid", "tx": "0x"+"ff"*32, "closed": False}
+m.handle_paid(st, net, "sepolia", iss, False)
+check("S29 erster Kontakt: gesehen mit seit, wartet", st["issues"]["120"]["state"]=="gesehen" and st["issues"]["120"]["seit"]>0 and not g.posts())
+st["issues"]["120"]["seit"] = int(_t.time()) - m.GESEHEN_MAX_S - 1; m.handle_paid(st, net, "sepolia", iss, False)
+check("S29b nach Frist: abgelehnt, Kommentar, Hash nicht verbraucht", st["issues"]["120"]["state"]=="abgelehnt" and len(g.posts())==1 and "0x"+"ff"*32 not in st["used_hashes"])
+g = FakeGH(); m.gh = g; st = m.empty_state(); st["issues"]["121"]={"state":"gesehen","login":"bob","tx":"0x"+"ab"*32,"seit": int(_t.time()) - m.GESEHEN_MAX_S - 1}
+m.verify_payment = lambda net, tx, num, created: ("pending", "low_conf", "nur 2 Bestätigungen", 0)
+m.handle_paid(st, net, "sepolia", {"number":121,"created":1.0,"login":"bob","kind":"paid","tx":"0x"+"ab"*32,"closed":False}, False)
+check("S29c low_conf nach Frist bleibt gesehen (Tx existiert)", st["issues"]["121"]["state"]=="gesehen" and not g.posts())
+
+# S30 pending_from_state: alte eingeladen nicht mehr nachgeladen, frische schon; Altbestand bekommt seit
+g = FakeGH(); m.gh = g; st = m.empty_state()
+st["issues"]["130"]={"state":"eingeladen","login":"bob","tx":"0x"+"01"*32,"seit": int(_t.time()) - m.REORG_WACHE_S - 1}
+st["issues"]["131"]={"state":"eingeladen","login":"bob","tx":"0x"+"02"*32,"seit": int(_t.time())}
+st["issues"]["132"]={"state":"eingeladen","login":"bob","tx":"0x"+"03"*32}
+out = m.pending_from_state(st, set()); nums = sorted(r["number"] for r in out)
+check("S30 Reorg-Wache: 130 beendet, 131 + 132 (Altbestand, seit gesetzt) geladen", nums==[131,132] and st["issues"]["132"].get("seit",0)>0, str(nums))
+
+# S31 gesehen zählt gegen die Autoren-Obergrenze: 3 gesehen + neues paid = excess; geschlossenes gesehen zählt nicht
+st = m.empty_state()
+for n in (140,141,142): st["issues"][str(n)]={"state":"gesehen","login":"bob","tx":"0x"+("%02x"%n)*32}
+mk=lambda n,kind,tx=None,closed=False: {"number":n,"created":float(n),"login":"bob","kind":kind,"tx":tx,"closed":closed}
+plan={i["number"]:a for i,a in m.build_plan([mk(140,"paid","0x"+"8c"*32), mk(141,"paid","0x"+"8d"*32), mk(142,"paid","0x"+"8e"*32), mk(143,"paid","0x"+"8f"*32)], st)}
+check("S31 drei gesehen + 4. paid → excess", plan.get(143)=="excess" and all(plan.get(n)=="process" for n in (140,141,142)), str(plan))
 
 # S11 Marker-Suche erkennt Pagination-Grenze als Fehler (nicht als 'kein Marker')
 g = FakeGH(); m.gh = g; g.comments[11] = [{"id": i, "body": "x"} for i in range(100*m.MAX_PAGES + 1)]

@@ -208,6 +208,8 @@ st = m.empty_state(); st["issues"]["80"]={"state":"eingeladen","login":"bob","tx
 check("S24 post-gestartet in offene_gates", m.offene_gates(st)==[80,81], str(m.offene_gates(st)))
 st["issues"]["82"]={"state":"abgelehnt","login":"bob","tx":"","grund":"frist","erledigt":{"at":True,"befund":"gefunden"}}; m.save_state(st, False); st2=m.load_state()
 check("S24b erledigt.at=True ist kein Zeitpunkt → verworfen, Gate offen", "erledigt" not in st2["issues"]["82"] and 82 in m.offene_gates(st2))
+st["issues"]["83"]={"state":"gesehen","login":"bob","tx":"0x"+"53"*32,"seit":True}; m.save_state(st, False); st2=m.load_state()
+check("S24c seit=True ist kein Zeitpunkt → verworfen", "seit" not in st2["issues"]["83"])
 
 # S25 Dedupe: gleiches Gate → ein Signal in zwei Läufen; geänderte Menge → neues Signal; Zeitpunkt im State
 g = FakeGH(); m.gh = g; st = m.empty_state(); st["issues"]["90"]={"state":"eingeladen","login":"bob","tx":"0x"+"dd"*32,"abschluss":"unklar"}; m.save_state(st, False)
@@ -336,6 +338,11 @@ m.verify_payment = lambda net, tx, num, created: ("ok","ok","ok",100305)
 rc=m.main(); check("S33d altes geschlossenes paid außerhalb des Fensters: kein PUT, kein Vorgang", rc==0 and not g.puts and "305" not in m.load_state()["issues"])
 g.issues[305]["updated_at"]=_t.strftime("%Y-%m-%dT%H:%M:%SZ", _t.gmtime()); rc=m.main()
 check("S33e frisch aktualisiert (im Fenster): wird nachversöhnt, ein PUT", rc==0 and g.puts==["bob"] and m.load_state()["issues"]["305"]["state"]=="eingeladen")
+# S33g Wasserstand nach Prüfer-Ausfall (Astra R4 P1, K2 R6): last_ok 5 Tage alt, Issue vor 4 Tagen geschlossen → im Fenster (last_ok − 24 h) → nachversöhnt
+g = FakeGH2(); m.gh = g; st = m.empty_state(); st["last_ok"] = int(_t.time()) - 5*86400; m.save_state(st, False)
+g.add(306, "paid:"+TX(306)); g.issues[306]["state"]="closed"; g.issues[306]["updated_at"]=_t.strftime("%Y-%m-%dT%H:%M:%SZ", _t.gmtime(_t.time() - 4*86400))
+m.verify_payment = lambda net, tx, num, created: ("ok","ok","ok",100306); sys.argv=["kcs402_check.py","--network","sepolia"]; rc=m.main()
+check("S33g Ausfall 5 d: vor 4 d geschlossenes paid liegt im Wasserstand-Fenster → ein PUT", rc==0 and g.puts==["bob"] and m.load_state()["issues"]["306"]["state"]=="eingeladen")
 # S33f Excess-Text bei paid ist ehrlich
 g = FakeGH2(); m.gh = g; st = m.empty_state()
 for n in (311,312,313):

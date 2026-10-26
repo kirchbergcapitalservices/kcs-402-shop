@@ -41,7 +41,10 @@ STATES = {"offen", "gesehen", "geprüft", "eingeladen", "abgelehnt", "widerruf-o
 # Astra R7 P2: Kommentar/Abschluss hat einen eigenen Zustand je Art. "post-gestartet" wird VOR dem POST gesichert;
 # ein Wiederanlauf in diesem Zustand postet nie automatisch erneut, sondern sucht den Marker in den vorhandenen
 # Kommentaren — fehlt er, ist der Ausgang unklar und ein Mensch entscheidet (--kommentar-freigeben).
-KOMMENTAR_FELD = {"abschluss": "abschluss", "widerruf": "widerruf_kommentar", "ephemer": "kommentar", "entscheid": "entscheid_kommentar"}
+KOMMENTAR_FELD = {"abschluss": "abschluss", "widerruf": "widerruf_kommentar", "ephemer": "kommentar",
+                  # Entscheid-Kommentar je Befund (Grok R17 / K2 R11: eine Befund-Korrektur muss den Käufer erreichen → eigener Marker je Befund)
+                  "entscheid-gefunden": "entscheid_gefunden", "entscheid-nicht-gefunden": "entscheid_nicht_gefunden", "entscheid-unbekannt": "entscheid_unbekannt"}
+ENTSCHEID_FELDER = ("entscheid_gefunden", "entscheid_nicht_gefunden", "entscheid_unbekannt")
 # "ephemer" (Fremdtitel/Überzahl ohne Vorgang) liegt in st["ephemer"][<nr>] = {"kommentar": <zustand>}, nicht in issues
 # (dort verlangt load_state einen Vorgangszustand). Review Grok/vibe 25.10.: close_ephemeral durch denselben Automaten.
 KOMMENTAR_ZUSTAENDE = {"post-gestartet", "kommentiert", "geschlossen", "unklar", "ersetzt"}  # ersetzt: Issue ist in den Zahlungspfad gewechselt
@@ -186,6 +189,8 @@ def load_state():
         st["used_hashes"][hl] = {"issue": val["issue"], "state": val["state"], "login": login_or_empty(val.get("login"))}
         if val.get("grund") in ("frist", "widerruf"):
             st["used_hashes"][hl]["grund"] = val["grund"]
+        if val.get("befund") in BEFUNDE:
+            st["used_hashes"][hl]["befund"] = val["befund"]
     for key, val in raw_i.items():
         need(isinstance(key, str) and ISSUE_KEY.fullmatch(key) and isinstance(val, dict), "issue")
         need(val.get("state") in STATES, "issue-zustand")
@@ -195,9 +200,11 @@ def load_state():
         for flag in ("notified", "invite_started", "we_added", "pre_existing"):
             if isinstance(val.get(flag), bool):
                 item[flag] = val[flag]
-        for feld in KOMMENTAR_FELD.values():  # Astra R7 P2 (abschluss, widerruf_kommentar, entscheid_kommentar; "kommentar" nur in ephemer)
+        for feld in KOMMENTAR_FELD.values():  # Astra R7 P2 ("kommentar" nur in ephemer)
             if val.get(feld) in KOMMENTAR_ZUSTAENDE:
                 item[feld] = val[feld]
+        if val.get("entscheid_geschlossen") in BEFUNDE:
+            item["entscheid_geschlossen"] = val["entscheid_geschlossen"]
         if isinstance(val.get("paid_units"), int) and not isinstance(val["paid_units"], bool) and val["paid_units"] >= 0:
             item["paid_units"] = val["paid_units"]
         if isinstance(val.get("seit"), int) and not isinstance(val["seit"], bool) and val["seit"] >= 0:  # Zeitpunkt von gesehen/eingeladen (K2 Bestand-P2)
@@ -516,7 +523,7 @@ def next_action(status, code, started):
 
 def marker(kind, num):
     """Deterministischer, unsichtbarer Marker je Issue und Kommentarart (HTML-Kommentar, von GitHub nicht gerendert)."""
-    need(kind in ("abschluss", "widerruf", "ephemer", "entscheid") and isinstance(num, int), "marker")
+    need(kind in KOMMENTAR_FELD and isinstance(num, int), "marker")
     return f"<!-- kcs-402:{kind}:#{num} -->"
 
 
@@ -682,10 +689,12 @@ def has_access(login):
     return isinstance(data, dict) and data.get("permission") in PERMS
 
 
-def bind_hash(st, tx, num, login, state, grund=None):
+def bind_hash(st, tx, num, login, state, grund=None, befund=None):
     eintrag = {"issue": num, "state": state, "login": login}
     if grund:
         eintrag["grund"] = grund
+    if befund:
+        eintrag["befund"] = befund
     st["used_hashes"][tx] = eintrag
 
 
@@ -699,7 +708,7 @@ def fail_issue(st, num, login, tx, comment, dry, consume, grund=None):
     if grund:
         rec["grund"] = grund
     if consume and tx:
-        bind_hash(st, tx, num, rec["login"], "abgelehnt")
+        bind_hash(st, tx, num, rec["login"], "abgelehnt", grund=grund)
     save_state(st, False)
     close_with_notice(st, num, comment, False)
 
@@ -794,23 +803,23 @@ def entscheid_text(rec):
 def close_entscheid(st, num, rec, dry):
     """K2 R10 Q3: nach einem Inhaber-Entscheid (grund=widerruf) steht der Entscheid als eigener Kommentar (Art entscheid), auch wenn der
     Abschluss-Marker aus grant() schon existiert; danach schließen. Idempotent über comment_once."""
+    need(rec.get("state") == "abgelehnt" and rec.get("grund") == "widerruf", "entscheid-ohne-widerruf")
     if dry:
         log(f"  [dry-run] Entscheid-Kommentar + schließen #{num}")
         return
-    need(rec.get("state") == "abgelehnt" and rec.get("grund") == "widerruf", "entscheid-ohne-widerruf")
-    if rec.get("entscheid_kommentar") == "geschlossen":
+    befund = (rec.get("erledigt") or {}).get("befund") or "unbekannt"
+    kind = f"entscheid-{befund}"
+    if rec.get("entscheid_geschlossen") == befund:  # dieser Befund wurde schon kommentiert und geschlossen
         if still_open(num):
             gh(f"repos/{SHOP}/issues/{num}", "PATCH", {"state": "closed"})
         return
     if not still_open(num):
-        rec["entscheid_kommentar"] = "geschlossen"
-        save_state(st, False)
-        return
-    if not comment_once(st, num, "entscheid", entscheid_text(rec)):
+        return  # Grok R17 P2: nicht als erledigt markieren — wird das Issue später geöffnet, erreicht der Entscheid den Käufer
+    if not comment_once(st, num, kind, entscheid_text(rec)):
         return
     if still_open(num):
         gh(f"repos/{SHOP}/issues/{num}", "PATCH", {"state": "closed"})
-    rec["entscheid_kommentar"] = "geschlossen"
+    rec["entscheid_geschlossen"] = befund
     save_state(st, False)
 
 
@@ -868,6 +877,8 @@ def handle_paid(st, net, net_name, iss, dry):
             rec.update({"state": "abgelehnt", "tx": tx, "login": rlogin})
             if owner.get("grund"):
                 rec["grund"] = owner["grund"]
+            if owner.get("befund") and "erledigt" not in rec:  # Grok R17 P2: Befund aus der Bindung, sonst generischer Entscheid-Text
+                rec["erledigt"] = {"at": 0, "befund": owner["befund"]}
             if not dry:
                 save_state(st, False)
             log(f"#{num} Vorgang aus used_hashes rekonstruiert (abgelehnt) — keine Zahlungsprüfung, Entscheid bleibt")
@@ -999,8 +1010,9 @@ def gate_arten(st):
             a.append(f"abschluss-{v['abschluss']}")
         if v.get("widerruf_kommentar") in wartend:
             a.append(f"widerruf-kommentar-{v['widerruf_kommentar']}")
-        if v.get("entscheid_kommentar") in wartend:
-            a.append(f"entscheid-kommentar-{v['entscheid_kommentar']}")
+        for ef in ENTSCHEID_FELDER:
+            if v.get(ef) in wartend:
+                a.append(f"{ef}-{v[ef]}")
         if v.get("state") == "abgelehnt" and v.get("grund") == "frist" and not v.get("erledigt"):
             a.append("frist-ablehnung")
         if a:
@@ -1090,8 +1102,9 @@ def main():
     ap.add_argument("--network", default=os.environ.get("KCS402_NETWORK", "sepolia"), choices=sorted(NET_ALIASES))
     ap.add_argument("--once-issue", type=int, default=None)
     ap.add_argument("--gate-erledigt", type=int, default=None, metavar="ISSUE",
-                    help="Inhaber-Entscheid, kein Lauf: Frist-Ablehnung als erledigt markieren (Zweitaufruf korrigiert den Befund) oder einen offenen Widerruf abschließen "
-                         "(wird terminal abgelehnt/widerruf, Hash bleibt gebunden). Den Zugang im Ware-Repo regelt der Inhaber vorher von Hand.")
+                    help="Inhaber-Entscheid, kein Lauf: Frist-Ablehnung als erledigt markieren oder einen offenen Widerruf abschließen (wird terminal "
+                         "abgelehnt/widerruf, Hash bleibt gebunden, Käufer erhält einen Entscheid-Kommentar je Befund). Ein Zweitaufruf korrigiert den Befund "
+                         "in beiden Fällen; beim Widerruf erhält der Käufer dann einen weiteren Kommentar. Den Zugang im Ware-Repo regelt der Inhaber vorher von Hand.")
     ap.add_argument("--befund", choices=sorted(BEFUNDE - {"unbekannt"}), default=None,
                     help="zu --gate-erledigt: Ergebnis der Inhaber-Prüfung auf der Kette. gefunden = Zahlung steht, Zugang wurde von Hand vergeben/belassen; "
                          "nicht-gefunden = keine gültige Zahlung, Zugang entzogen/nicht vergeben. Bestimmt den Kommentar an den Käufer.")
@@ -1124,7 +1137,9 @@ def main():
             if rec.get("state") == "abgelehnt" and rec.get("grund") == "widerruf":  # Grok R16: Befund-Korrektur auch beim entschiedenen Widerruf
                 vorher = (rec.get("erledigt") or {}).get("befund")
                 rec["erledigt"] = {"at": int(time.time()), "befund": args.befund}
-                rec.pop("entscheid_kommentar", None) if rec.get("entscheid_kommentar") not in ("post-gestartet", "unklar") else None  # neuer Entscheid-Kommentar erlaubt
+                rec.pop("entscheid_geschlossen", None)  # neuer Befund → neuer Entscheid-Kommentar mit eigenem Marker (Grok R17 / K2 R11 P3-1)
+                if rec.get("tx"):
+                    bind_hash(st, rec["tx"], args.gate_erledigt, rec.get("login") or "", "abgelehnt", grund="widerruf", befund=args.befund)
                 if not args.dry_run:
                     save_state(st, False)
                 log(f"#{args.gate_erledigt} Widerruf-Befund korrigiert: {args.befund} (vorher {vorher}, dry={args.dry_run})")
@@ -1132,7 +1147,7 @@ def main():
             if rec.get("state") == "widerruf-offen":  # K2 R9 P3-5: Inhaber-Ausgang für den Widerruf; Zugang regelt der Inhaber von Hand
                 rec.update({"state": "abgelehnt", "grund": "widerruf", "erledigt": {"at": int(time.time()), "befund": args.befund}})
                 if rec.get("tx"):
-                    bind_hash(st, rec["tx"], args.gate_erledigt, rec.get("login") or "", "abgelehnt", grund="widerruf")
+                    bind_hash(st, rec["tx"], args.gate_erledigt, rec.get("login") or "", "abgelehnt", grund="widerruf", befund=args.befund)
                 if not args.dry_run:
                     save_state(st, False)
                 log(f"#{args.gate_erledigt} Widerruf vom Inhaber entschieden: Befund {args.befund} (Zugang von Hand geregelt, Hash bleibt gebunden, dry={args.dry_run})")
@@ -1150,7 +1165,7 @@ def main():
             key = str(args.kommentar_freigeben)
             rec, eph = st["issues"].get(key) or {}, st.get("ephemer", {}).get(key) or {}
             wartend = ("unklar", "post-gestartet")  # Grok R5 P2: auch ein nie aufgelöster post-gestartet-Zustand
-            frei = [f for f in ("abschluss", "widerruf_kommentar", "entscheid_kommentar") if rec.get(f) in wartend] + (["kommentar"] if eph.get("kommentar") in wartend else [])
+            frei = [f for f in ("abschluss", "widerruf_kommentar", *ENTSCHEID_FELDER) if rec.get(f) in wartend] + (["kommentar"] if eph.get("kommentar") in wartend else [])
             for f in frei:
                 (eph if f == "kommentar" else rec).pop(f, None)
             if frei and not args.dry_run:

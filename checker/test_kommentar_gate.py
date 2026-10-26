@@ -493,7 +493,7 @@ g = FakeGH2(); m.gh = g; st = m.empty_state(); g.add(700, "paid:"+TX(700)); st["
 sys.argv=["kcs402_check.py","--gate-erledigt","700","--befund","gefunden"]; rc=m.main(); st3=m.load_state()
 check("S45 Widerruf entschieden: abgelehnt/widerruf, Gate zu, Hash abgelehnt", rc==0 and st3["issues"]["700"]["state"]=="abgelehnt" and st3["issues"]["700"]["grund"]=="widerruf" and 700 not in m.offene_gates(st3) and st3["used_hashes"][TX(700)]["state"]=="abgelehnt")
 m.verify_payment = lambda net, tx, num, created: ("ok","ok","ok",100700); sys.argv=["kcs402_check.py","--network","sepolia"]; rc=m.main()
-check("S45b Folgelauf: Issue geschlossen mit Entscheid-Kommentar (eigene Art), kein PUT, rc 0", rc==0 and not g.puts and any("Vorgang vom Inhaber entschieden: Zahlung bestätigt" in c["body"] and m.marker("entscheid",700) in c["body"] for c in g.comments.get(700, [])) and g.issues[700]["state"]=="closed")
+check("S45b Folgelauf: Issue geschlossen mit Entscheid-Kommentar (eigene Art), kein PUT, rc 0", rc==0 and not g.puts and any("Vorgang vom Inhaber entschieden: Zahlung bestätigt" in c["body"] and m.marker("entscheid-gefunden",700) in c["body"] for c in g.comments.get(700, [])) and g.issues[700]["state"]=="closed")
 
 # S46 ephemer kommentiert bei geschlossenem Issue wird bereinigt
 st = m.empty_state(); st["ephemer"]["710"]={"kommentar":"kommentiert"}; st["ephemer"]["711"]={"kommentar":"kommentiert"}
@@ -508,18 +508,38 @@ check("S47 gesehen + Bindung geprüft: kein PUT, widerruf-offen", not g.puts and
 g = FakeGH2(); m.gh = g; st = m.empty_state(); g.add(730, "paid:"+TX(730)); g.comments[730]=[{"id":1,"body":"alt "+m.marker("abschluss",730),"user":{"login":"kirchbergcapital"}}]
 st["issues"]["730"]={"state":"widerruf-offen","login":"bob","tx":TX(730),"abschluss":"geschlossen","notified":True}; m.bind_hash(st, TX(730), 730, "bob", "widerruf-offen"); m.save_state(st, False)
 sys.argv=["kcs402_check.py","--gate-erledigt","730","--befund","nicht-gefunden"]; m.main(); sys.argv=["kcs402_check.py","--network","sepolia"]; rc=m.main(); st3=m.load_state()
-check("S48 Entscheid-Kommentar trotz Abschluss-Marker, geschlossen, kein PUT", rc==0 and not g.puts and any("nicht bestätigt, kein Zugang" in c["body"] for c in g.comments[730]) and g.issues[730]["state"]=="closed" and st3["issues"]["730"]["entscheid_kommentar"]=="geschlossen")
+check("S48 Entscheid-Kommentar trotz Abschluss-Marker, geschlossen, kein PUT", rc==0 and not g.puts and any("nicht bestätigt, kein Zugang" in c["body"] for c in g.comments[730]) and g.issues[730]["state"]=="closed" and st3["issues"]["730"]["entscheid_geschlossen"]=="nicht-gefunden")
 n=len(g.posts()); rc=m.main(); check("S48b Folgelauf: kein weiterer Kommentar", len(g.posts())==n)
 
 # S49 Befund-Korrektur beim entschiedenen Widerruf
 sys.argv=["kcs402_check.py","--gate-erledigt","730","--befund","gefunden"]; rc=m.main(); st3=m.load_state()
 check("S49 Widerruf-Befund korrigiert, Zustand bleibt abgelehnt/widerruf", rc==0 and st3["issues"]["730"]["erledigt"]["befund"]=="gefunden" and st3["issues"]["730"]["state"]=="abgelehnt" and st3["issues"]["730"]["grund"]=="widerruf")
+# S49b K2 KORR / Grok P2: Korrektur erreicht den Käufer — Issue wieder offen → zweiter Entscheid-Kommentar (gefunden), geschlossen; danach idempotent
+g.issues[730]["state"]="open"; n=len(g.posts()); sys.argv=["kcs402_check.py","--network","sepolia"]; rc=m.main(); st3=m.load_state()
+check("S49b korrigierter Befund erreicht den Käufer: genau ein weiterer Kommentar (gefunden), zu, kein PUT", rc==0 and len(g.posts())==n+1 and "Zahlung bestätigt" in g.comments[730][-1]["body"] and m.marker("entscheid-gefunden",730) in g.comments[730][-1]["body"] and g.issues[730]["state"]=="closed" and not g.puts)
+n=len(g.posts()); g.issues[730]["state"]="open"; rc=m.main(); check("S49c Hin und her: kein dritter Kommentar, nur schließen", len(g.posts())==n and g.issues[730]["state"]=="closed")
 
 # S50 grund wandert mit der Bindung: Rekonstruktion eines abgelehnt/widerruf ohne Vorgang behält den Entscheid-Pfad
 st = m.empty_state(); m.bind_hash(st, TX(740), 740, "bob", "abgelehnt", grund="widerruf"); m.save_state(st, False); st2=m.load_state()
 check("S50 grund im used_hashes-Roundtrip", st2["used_hashes"][TX(740)].get("grund")=="widerruf")
 g = FakeGH2(); m.gh = g; g.add(740, "paid:"+TX(740)); sys.argv=["kcs402_check.py","--network","sepolia"]; rc=m.main(); st3=m.load_state()
-check("S50b Rekonstruktion abgelehnt/widerruf: Entscheid-Kommentar, kein PUT, kein verify", not g.puts and st3["issues"]["740"]["grund"]=="widerruf" and any(m.marker("entscheid",740) in c["body"] for c in g.comments.get(740, [])))
+check("S50b Rekonstruktion abgelehnt/widerruf: Entscheid-Kommentar (generisch, kein Befund in der Bindung), kein PUT", not g.puts and st3["issues"]["740"]["grund"]=="widerruf" and any(m.marker("entscheid-unbekannt",740) in c["body"] for c in g.comments.get(740, [])))
+# S50c Befund wandert mit der Bindung (Grok R17 P2): Rekonstruktion liefert den Befund-Text
+st = m.empty_state(); m.bind_hash(st, TX(741), 741, "bob", "abgelehnt", grund="widerruf", befund="nicht-gefunden"); m.save_state(st, False)
+g = FakeGH2(); m.gh = g; g.add(741, "paid:"+TX(741)); sys.argv=["kcs402_check.py","--network","sepolia"]; rc=m.main(); st3=m.load_state()
+check("S50c Befund aus Bindung: Text nicht-gefunden, kein PUT", not g.puts and any("nicht bestätigt, kein Zugang" in c["body"] and m.marker("entscheid-nicht-gefunden",741) in c["body"] for c in g.comments.get(741, [])) and st3["issues"]["741"]["erledigt"]["befund"]=="nicht-gefunden")
+# S50d Grok R17 P2: geschlossenes Issue beim Entscheid → nichts markiert; später geöffnet → Entscheid erreicht den Käufer
+st = m.empty_state(); m.bind_hash(st, TX(742), 742, "bob", "abgelehnt", grund="widerruf", befund="gefunden"); st["last_ok"]=int(_t.time()); m.save_state(st, False)
+g = FakeGH2(); m.gh = g; g.add(742, "paid:"+TX(742)); g.issues[742]["state"]="closed"; g.issues[742]["updated_at"]=_t.strftime("%Y-%m-%dT%H:%M:%SZ", _t.gmtime()); rc=m.main(); st3=m.load_state()
+check("S50d zu beim Entscheid: kein Kommentar, nichts markiert", not g.posts() and "entscheid_geschlossen" not in st3["issues"]["742"])
+g.issues[742]["state"]="open"; rc=m.main(); check("S50e später geöffnet: Entscheid-Kommentar + zu", len(g.posts())==1 and g.issues[742]["state"]=="closed" and not g.puts)
+
+# S51 Fall K (vibe R17 „P1“ = Fehlalarm): echte Reservierung (invite_started/paid_units/pre_existing=False gespeichert), PUT lief, Save fehlte → Wiederanlauf: idempotenter PUT auf denselben Login, dann eingeladen; Lauf 3 kein PUT
+g = FakeGH2(); m.gh = g; st = m.empty_state(); g.add(750, "paid:"+TX(750)); g.invited.add("bob")  # PUT war schon angekommen
+st["issues"]["750"]={"state":"geprüft","login":"bob","tx":TX(750),"paid_units":100750,"invite_started":True,"pre_existing":False,"we_added":True,"seit":int(_t.time())}; m.bind_hash(st, TX(750), 750, "bob", "geprüft"); m.save_state(st, False)
+m.verify_payment = lambda net, tx, num, created: ("ok","ok","ok",100750); sys.argv=["kcs402_check.py","--network","sepolia"]; rc=m.main(); st3=m.load_state()
+check("S51 Fall K: genau ein (idempotenter) PUT auf denselben Login, eingeladen, Hash gebunden", g.puts==["bob"] and st3["issues"]["750"]["state"]=="eingeladen" and st3["used_hashes"][TX(750)]["state"]=="eingeladen")
+rc=m.main(); check("S51b Lauf 3: kein weiterer PUT", g.puts==["bob"])
 
 # S40 Größenwarnung: rc 3 + ein Signal je 24 h; kein Signal im Trockenlauf
 g = FakeGH2(); m.gh = g; st = m.empty_state(); m.save_state(st, False); alt_warn = m.STATE_WARN_BYTES; m.STATE_WARN_BYTES = 10

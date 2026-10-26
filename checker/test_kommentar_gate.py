@@ -401,13 +401,24 @@ st["issues"]["606"]={"state":"gesehen","login":"bob","tx":TX(606),"seit":now}
 st["issues"]["607"]={"state":"eingeladen","login":"bob","tx":TX(607),"abschluss":"geschlossen","seit":now-m.REORG_WACHE_S-10}  # offen gelistet
 for n in (600,601,605,606,607): m.bind_hash(st, TX(n), n, "bob", st["issues"][str(n)]["state"])
 weg = m.bereinigen(st, {"607"})
-check("S39 entfernt: 600 (alt+zu), 602, 604; behält: 601 (Wache läuft), 603 (Frist-Gate offen), 605, 606, 607 (offen)", sorted(st["issues"])==["601","603","605","606","607"] and weg["issues"]==3, str(sorted(st["issues"])))
+check("S39 Vorgänge werden NIE gelöscht (Sicherheits-Review 26.10. HIGH): alle acht bleiben", sorted(st["issues"])==["600","601","602","603","604","605","606","607"] and weg["issues"]==0, str(sorted(st["issues"])))
 check("S39b used_hashes vollständig, alte Einladung weg, heutige bleibt", len(st["used_hashes"])==5 and st["used_hashes"][TX(600)]["issue"]==600 and [i["issue"] for i in st["invites"]]==[601] and weg["invites"]==1)
 # Wiederanlauf eines bereinigten eingeladenen Issues: Marker verhindert Zweitkommentar, kein zweiter PUT
 g = FakeGH2(); m.gh = g; g.add(600, "paid:"+TX(600)); g.comments[600]=[{"id":1,"body":"alt "+m.marker("abschluss",600),"user":{"login":"kirchbergcapital"}}]; g.invited.add("bob")
 m.verify_payment = lambda net, tx, num, created: ("ok","ok","ok",100600); m.save_state(st, False)
 sys.argv=["kcs402_check.py","--network","sepolia"]; rc=m.main(); st2=m.load_state()
-check("S39c wiedereröffnet nach Bereinigung: Vorgang aus used_hashes rekonstruiert, kein PUT, kein POST, geschlossen", not g.puts and not g.posts() and len(g.patches())==1 and st2["issues"]["600"]["state"]=="eingeladen" and st2["issues"]["600"].get("abschluss")=="geschlossen")
+check("S39c wiedereröffnetes eingeladenes Issue: Vorgang blieb erhalten → reorg_watch-Pfad, kein PUT, kein POST, nur PATCH", not g.puts and not g.posts() and len(g.patches())==1 and st2["issues"]["600"]["state"]=="eingeladen" and st2["issues"]["600"].get("abschluss")=="geschlossen")
+# S39d Gegenprobe zum Sicherheits-Review (HIGH): Vorgang fehlt in issues (z. B. Altbestand), used_hashes sagt eingeladen, Zugang von Hand
+# entzogen (bob kein Collaborator), Issue wiedereröffnet → KEIN erneuter PUT; Abschluss nur über den vorhandenen Marker
+st = m.empty_state(); m.bind_hash(st, TX(600), 600, "bob", "eingeladen"); m.save_state(st, False)
+g = FakeGH2(); m.gh = g; g.add(600, "paid:"+TX(600)); g.comments[600]=[{"id":1,"body":"alt "+m.marker("abschluss",600),"user":{"login":"kirchbergcapital"}}]  # bob NICHT invited
+m.verify_payment = lambda net, tx, num, created: ("ok","ok","ok",100600); sys.argv=["kcs402_check.py","--network","sepolia"]; rc=m.main(); st3=m.load_state()
+check("S39d rekonstruiert aus used_hashes + Zugang entzogen: kein Re-Grant (kein PUT), kein neuer Kommentar, geschlossen", not g.puts and not g.posts() and len(g.patches())==1 and st3["issues"]["600"]["state"]=="eingeladen" and st3["issues"]["600"].get("abschluss")=="geschlossen", str(g.puts))
+# S39e rekonstruiert als abgelehnt (Hash verbraucht): keine Zahlungsprüfung, kein PUT
+st = m.empty_state(); m.bind_hash(st, TX(610), 610, "bob", "abgelehnt"); m.save_state(st, False)
+g = FakeGH2(); m.gh = g; g.add(610, "paid:"+TX(610)); aufrufe=[]; m.verify_payment = lambda net, tx, num, created: (aufrufe.append(num), ("ok","ok","ok",100610))[1]
+rc=m.main(); st3=m.load_state()
+check("S39e rekonstruiert als abgelehnt: verify nicht aufgerufen, kein PUT, Issue geschlossen mit Ablehnungs-Kommentar", not aufrufe and not g.puts and st3["issues"]["610"]["state"]=="abgelehnt" and len(g.patches())==1, str((aufrufe, g.puts)))
 
 # S40 Größenwarnung: rc 3 + ein Signal je 24 h; kein Signal im Trockenlauf
 g = FakeGH2(); m.gh = g; st = m.empty_state(); m.save_state(st, False); alt_warn = m.STATE_WARN_BYTES; m.STATE_WARN_BYTES = 10

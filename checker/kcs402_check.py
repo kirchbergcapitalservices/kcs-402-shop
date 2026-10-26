@@ -782,6 +782,20 @@ def handle_paid(st, net, net_name, iss, dry):
         rec.update({"state": owner["state"], "tx": tx, "login": login})
         if not dry:
             save_state(st, False)
+        # Sicherheits-Review 26.10. (HIGH, Tiefenverteidigung): ein aus used_hashes rekonstruierter Vorgang darf nie wieder in
+        # grant()/PUT laufen — "eingeladen" geht in die Reorg-Wache (Abschluss nur über Marker), alles andere Entschiedene endet hier.
+        if rec["state"] == "eingeladen":
+            log(f"#{num} Vorgang aus used_hashes rekonstruiert (eingeladen) — kein erneuter PUT, Reorg-Wache")
+            reorg_watch(st, net, iss, rec, dry)
+            return
+        if rec["state"] == "abgelehnt":
+            log(f"#{num} Vorgang aus used_hashes rekonstruiert (abgelehnt) — keine Zahlungsprüfung, Entscheid bleibt")
+            close_with_notice(st, num, "Zahlung bereits abgelehnt. Kein Zugang.", dry)
+            return
+        if rec["state"] == "widerruf-offen":
+            log(f"#{num} Vorgang aus used_hashes rekonstruiert (widerruf-offen) — Menschen-Gate bleibt")
+            revoke(st, num, login, tx, "Widerruf wartet auf Entscheidung des Inhabers.", dry)
+            return
     if not login or not LOGIN_RE.fullmatch(login):
         log(f"#{num} Login fehlt, bleibt offen")
         return
@@ -927,28 +941,20 @@ def signal_faellig(st, gates):
 
 
 def bereinigen(st, open_nums):
-    """Zustandsdatei begrenzen, ohne Sicherheitsdaten zu verlieren: used_hashes bleiben IMMER (Replay-Schutz).
-    Entfernt: Einladungen älter als INVITES_BEHALTEN_TAGE (at_cap zählt nur heute) · abgeschlossene Vorgänge geschlossener Issues
-    (abgelehnt ohne offenes Frist-Gate; eingeladen mit Abschluss nach Ende der Reorg-Wache — der Marker macht einen Wiederanlauf
-    idempotent, used_hashes trägt Issue + Login) · ephemer-Einträge geschlossen (nicht offen gelistet) oder ersetzt."""
+    """Zustandsdatei begrenzen, ohne Sicherheitsdaten zu verlieren: used_hashes UND issues bleiben IMMER.
+    Sicherheits-Review 26.10. (HIGH): ein bereinigter eingeladen-Vorgang würde bei Wiedereröffnung aus used_hashes ohne
+    invite_started/pre_existing rekonstruiert und könnte in grant() einen von Hand entzogenen Zugang erneut vergeben; ein
+    bereinigter abgelehnt-Vorgang verlöre den Inhaber-Entscheid. Deshalb werden Vorgänge nie gelöscht (jeder ist ein echtes
+    GitHub-Issue, je Autor durch MAX_OPEN begrenzt; die 5-MB-Grenze meldet groesse_pruefen rechtzeitig).
+    Entfernt werden nur: Einladungen älter als INVITES_BEHALTEN_TAGE (at_cap zählt nur heute; der Vorgang selbst bleibt in
+    issues/used_hashes) · ephemer-Einträge geschlossen (nicht offen gelistet) oder ersetzt (kein Vorgang, kein Hash)."""
     grenze = time.strftime("%Y-%m-%d", time.gmtime(time.time() - INVITES_BEHALTEN_TAGE * 86_400))
     vorher = len(st["invites"])
     st["invites"] = [i for i in st["invites"] if str(i.get("day", "")) >= grenze]
-    weg = []
-    now = int(time.time())
-    for key, rec in st["issues"].items():
-        if key in open_nums:
-            continue
-        if rec.get("state") == "abgelehnt" and (rec.get("grund") != "frist" or rec.get("erledigt")):
-            weg.append(key)
-        elif rec.get("state") == "eingeladen" and rec.get("abschluss") == "geschlossen" and now - int(rec.get("seit", now)) > REORG_WACHE_S:
-            weg.append(key)
-    for key in weg:
-        del st["issues"][key]
     eph_weg = [k for k, v in st.get("ephemer", {}).items() if v.get("kommentar") == "ersetzt" or (v.get("kommentar") == "geschlossen" and k not in open_nums)]
     for key in eph_weg:
         del st["ephemer"][key]
-    return {"invites": vorher - len(st["invites"]), "issues": len(weg), "ephemer": len(eph_weg)}
+    return {"invites": vorher - len(st["invites"]), "issues": 0, "ephemer": len(eph_weg)}
 
 
 def groesse_pruefen(st, dry):

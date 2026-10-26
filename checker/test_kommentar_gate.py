@@ -468,6 +468,37 @@ st = m.empty_state(); st["used_hashes"][TX(662)]={"issue":662,"state":"gesehen",
 g = FakeGH2(); m.gh = g; g.add(662, "paid:"+TX(662)); rc=m.main(); st3=m.load_state()
 check("S39j unbekannter Hash-Zustand → widerruf-offen, kein PUT", not g.puts and st3["issues"]["662"]["state"]=="widerruf-offen")
 
+# S42 K2 Probe M: Vorgang gesehen/geprüft, Bindung sagt eingeladen → kein PUT, Vorgang folgt der Bindung
+for st_state in ("gesehen", "geprüft"):
+    g = FakeGH2(); m.gh = g; st = m.empty_state(); g.add(670, "paid:"+TX(670))
+    st["issues"]["670"]={"state":st_state,"login":"bob","tx":TX(670),"seit":int(_t.time()),"paid_units":100670,"invite_started":False}; m.bind_hash(st, TX(670), 670, "bob", "eingeladen"); m.save_state(st, False)
+    m.verify_payment = lambda net, tx, num, created: ("ok","ok","ok",100670); sys.argv=["kcs402_check.py","--network","sepolia"]; rc=m.main(); st3=m.load_state()
+    check(f"S42 {st_state} + Bindung eingeladen: kein PUT, Vorgang eingeladen", not g.puts and st3["issues"]["670"]["state"]=="eingeladen", str(g.puts))
+
+# S43 K2 Probe N2: eingeladen ohne tx, fremder Titel-Hash, Issue zu → kein PUT, Zustand bleibt eingeladen (nicht abgelehnt)
+g = FakeGH2(); m.gh = g; st = m.empty_state(); st["issues"]["680"]={"state":"eingeladen","login":"bob","tx":""}; m.bind_hash(st, TX(681), 681, "carol", "eingeladen"); st["last_ok"]=int(_t.time()); m.save_state(st, False)
+g.add(680, "paid:"+TX(681)); g.issues[680]["state"]="closed"; g.issues[680]["updated_at"]=_t.strftime("%Y-%m-%dT%H:%M:%SZ", _t.gmtime())
+m.verify_payment = lambda net, tx, num, created: ("ok","ok","ok",100680); rc=m.main(); st3=m.load_state()
+check("S43 eingeladen ohne tx + fremder Hash: kein PUT, bleibt eingeladen", not g.puts and st3["issues"]["680"]["state"]=="eingeladen", str((g.puts, st3["issues"]["680"]["state"])))
+
+# S44 K2 Probe O / Grok R14 P2: geprüft ohne seit bekommt seit im Nachladen; 8 Tage später Frist → Gate
+g = FakeGH2(); m.gh = g; st = m.empty_state(); st["issues"]["690"]={"state":"geprüft","login":"bob","tx":TX(690),"paid_units":100690,"invite_started":False}; m.bind_hash(st, TX(690), 690, "bob", "geprüft")
+out = m.pending_from_state(st, set()); check("S44 geprüft ohne seit → seit nachgetragen", st["issues"]["690"].get("seit",0)>0)
+st["issues"]["690"]["seit"] = int(_t.time()) - m.GESEHEN_MAX_S - 1; g.add(690, "paid:"+TX(690)); m.verify_payment = lambda net, tx, num, created: ("pending","not_found","x",0)
+m.handle_paid(st, net, "sepolia", {"number":690,"created":1.0,"login":"bob","kind":"paid","tx":TX(690),"closed":False}, False)
+check("S44b alte Reservierung → Gate, kein PUT", st["issues"]["690"]["state"]=="widerruf-offen" and not g.puts)
+
+# S45 Inhaber-Ausgang für widerruf-offen: --gate-erledigt --befund → abgelehnt/widerruf, Gate zu, Hash gebunden, dispatch schließt mit Inhaber-Text, kein PUT
+g = FakeGH2(); m.gh = g; st = m.empty_state(); g.add(700, "paid:"+TX(700)); st["issues"]["700"]={"state":"widerruf-offen","login":"bob","tx":TX(700)}; m.bind_hash(st, TX(700), 700, "bob", "widerruf-offen"); m.save_state(st, False)
+sys.argv=["kcs402_check.py","--gate-erledigt","700","--befund","gefunden"]; rc=m.main(); st3=m.load_state()
+check("S45 Widerruf entschieden: abgelehnt/widerruf, Gate zu, Hash abgelehnt", rc==0 and st3["issues"]["700"]["state"]=="abgelehnt" and st3["issues"]["700"]["grund"]=="widerruf" and 700 not in m.offene_gates(st3) and st3["used_hashes"][TX(700)]["state"]=="abgelehnt")
+m.verify_payment = lambda net, tx, num, created: ("ok","ok","ok",100700); sys.argv=["kcs402_check.py","--network","sepolia"]; rc=m.main()
+check("S45b Folgelauf: Issue geschlossen mit Inhaber-Text, kein PUT, rc 0", rc==0 and not g.puts and any("vom Inhaber entschieden" in c["body"] for c in g.comments.get(700, [])) and g.issues[700]["state"]=="closed")
+
+# S46 ephemer kommentiert bei geschlossenem Issue wird bereinigt
+st = m.empty_state(); st["ephemer"]["710"]={"kommentar":"kommentiert"}; st["ephemer"]["711"]={"kommentar":"kommentiert"}
+weg = m.bereinigen(st, {"711"}); check("S46 ephemer kommentiert: zu → weg, offen → bleibt", "710" not in st["ephemer"] and "711" in st["ephemer"])
+
 # S40 Größenwarnung: rc 3 + ein Signal je 24 h; kein Signal im Trockenlauf
 g = FakeGH2(); m.gh = g; st = m.empty_state(); m.save_state(st, False); alt_warn = m.STATE_WARN_BYTES; m.STATE_WARN_BYTES = 10
 sig=[]; m.signal_mensch = lambda t: (sig.append(t), True)[1]; sys.argv=["kcs402_check.py","--network","sepolia"]; rc1=m.main(); rc2=m.main()

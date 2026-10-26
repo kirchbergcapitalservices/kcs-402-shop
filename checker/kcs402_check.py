@@ -200,8 +200,8 @@ def load_state():
             item["paid_units"] = val["paid_units"]
         if isinstance(val.get("seit"), int) and not isinstance(val["seit"], bool) and val["seit"] >= 0:  # Zeitpunkt von gesehen/eingeladen (K2 Bestand-P2)
             item["seit"] = val["seit"]
-        if val.get("grund") == "frist":  # K2 R3 P2: Frist-Ablehnung bleibt Menschen-Gate, bis der Inhaber sie erledigt
-            item["grund"] = "frist"
+        if val.get("grund") in ("frist", "widerruf"):  # frist: Menschen-Gate bis erledigt · widerruf: vom Inhaber entschiedener Widerruf
+            item["grund"] = val["grund"]
         erl = val.get("erledigt")
         if erl is True:  # Altformat (26.10. vormittags): ohne Zeitpunkt und Befund
             item["erledigt"] = {"at": 0, "befund": "unbekannt"}
@@ -331,7 +331,7 @@ def pending_from_state(st, loaded_numbers):
         if rec.get("state") not in ("gesehen", "geprüft", "widerruf-offen", "eingeladen"):
             continue
         num = int(key)
-        if rec.get("state") in ("gesehen", "eingeladen") and "seit" not in rec:
+        if rec.get("state") in ("gesehen", "eingeladen", "geprüft") and "seit" not in rec:  # geprüft: K2 R9 Probe O / Grok R14 P2
             rec["seit"] = int(time.time())  # Altbestand ohne Zeitstempel: Frist beginnt jetzt (wird am Laufende gesichert)
         if rec.get("state") == "eingeladen" and int(time.time()) - int(rec.get("seit", 0)) > REORG_WACHE_S:
             continue  # K2 Bestand-P2: Reorg-Wache beendet; Hash bleibt gebunden, offen gelistete Issues laufen weiter über dispatch
@@ -777,9 +777,25 @@ def reorg_watch(st, net, iss, rec, dry):
     revoke(st, num, iss["login"], tx, f"{code}: {detail}", dry)
 
 
+def abgelehnt_text(rec):
+    return "Vorgang vom Inhaber entschieden; der Zugang wurde von Hand geregelt." if rec.get("grund") == "widerruf" else "Zahlung bereits abgelehnt. Kein Zugang."
+
+
 def handle_paid(st, net, net_name, iss, dry):
     num, login, created = iss["number"], iss["login"], iss["created"]
     rec = st["issues"].get(str(num)) or {}
+    # K2 R9 Probe N2 + Probe H: der Riegel für entschiedene Zustände steht VOR jeder Hash-/Eigentümer-Prüfung, damit ein
+    # gespeicherter Vorgang (auch ohne tx, auch mit fremdem Titel-Hash) weder umgeschrieben noch neu geprüft wird.
+    if rec.get("state") == "eingeladen":
+        log(f"#{num} eingeladen ohne Reorg-Pfad (tx fehlt?) — kein PUT, nur Abschluss über Marker")
+        close_with_notice(st, num, f"Zugang besteht: @{rec.get('login') or login} ist read-only auf {WARE}.", dry)
+        return
+    if rec.get("state") == "abgelehnt":
+        close_with_notice(st, num, abgelehnt_text(rec), dry)
+        return
+    if rec.get("state") == "widerruf-offen":
+        revoke(st, num, rec.get("login") or login, rec.get("tx") or "", "Widerruf wartet auf Entscheidung des Inhabers.", dry)
+        return
     tx = (rec.get("tx") or iss.get("tx") or "").lower() if rec.get("state") == "geprüft" else iss.get("tx")
     if not isinstance(tx, str) or not HEX64.fullmatch(tx):
         log(f"#{num} Hash ungültig, bleibt offen")
@@ -789,7 +805,10 @@ def handle_paid(st, net, net_name, iss, dry):
     if owner and owner["issue"] != num:
         fail_issue(st, num, login, tx, f"Transaktion bereits für Issue #{owner['issue']} verbraucht.", dry, False)
         return
-    if owner and owner["issue"] == num and rec.get("state", "offen") == "offen" and owner["state"] != "offen":
+    entschieden = ("eingeladen", "abgelehnt", "widerruf-offen")
+    # K2 R9 Probe M: auch ein Vorgang in gesehen/geprüft folgt der schon entschiedenen Bindung desselben Issues — nie grant()
+    if owner and owner["issue"] == num and owner["state"] != "offen" and (
+            rec.get("state", "offen") == "offen" or (rec.get("state") in ("gesehen", "geprüft") and owner["state"] in entschieden)):
         # Sicherheits-Review 26.10. (HIGH) + Grok R13 (P1 Absturzfenster): ein aus used_hashes rekonstruierter Vorgang darf nie in
         # grant()/PUT laufen, und zwischen Rekonstruktion und Abzweig darf KEIN Zwischenzustand gespeichert werden — sonst läge nach
         # einem Absturz eine "geprüft"-Reservierung ohne Reservierungsfelder, die der nächste Lauf einladen würde.
@@ -797,6 +816,7 @@ def handle_paid(st, net, net_name, iss, dry):
         if owner["state"] == "eingeladen":
             rec = st["issues"].setdefault(str(num), {})
             rec.update({"state": "eingeladen", "tx": tx, "login": rlogin})
+            rec.pop("invite_started", None)  # Bindung sagt eingeladen: der PUT ist durch; grant() darf hier nie wieder greifen
             if not dry:
                 save_state(st, False)
             log(f"#{num} Vorgang aus used_hashes rekonstruiert (eingeladen) — kein erneuter PUT, Reorg-Wache")
@@ -808,7 +828,7 @@ def handle_paid(st, net, net_name, iss, dry):
             if not dry:
                 save_state(st, False)
             log(f"#{num} Vorgang aus used_hashes rekonstruiert (abgelehnt) — keine Zahlungsprüfung, Entscheid bleibt")
-            close_with_notice(st, num, "Zahlung bereits abgelehnt. Kein Zugang.", dry)
+            close_with_notice(st, num, abgelehnt_text(rec), dry)
             return
         # widerruf-offen, geprüft (Reservierung ohne Vorgangsdaten) und jeder unbekannte Zustand: Menschen-Gate; revoke() schreibt
         # den Zielzustand widerruf-offen in EINEM Save — kein Zwischenstand "geprüft" auf der Platte.
@@ -820,18 +840,6 @@ def handle_paid(st, net, net_name, iss, dry):
         return
     if not login or not LOGIN_RE.fullmatch(login):
         log(f"#{num} Login fehlt, bleibt offen")
-        return
-    # K2 R8 Probe H (allgemeiner Riegel): ein entschiedener Vorgang — gespeichert oder rekonstruiert, mit oder ohne tx —
-    # erreicht weder verify_payment noch grant(). dispatch leitet solche Sätze normalerweise vorher um; dies ist die zweite Wand.
-    if rec.get("state") == "eingeladen":
-        log(f"#{num} eingeladen ohne Reorg-Pfad (tx fehlt?) — kein PUT, nur Abschluss über Marker")
-        close_with_notice(st, num, f"Zugang besteht: @{login} ist read-only auf {WARE}.", dry)
-        return
-    if rec.get("state") == "abgelehnt":
-        close_with_notice(st, num, "Zahlung bereits abgelehnt. Kein Zugang.", dry)
-        return
-    if rec.get("state") == "widerruf-offen":
-        revoke(st, num, login, tx, "Widerruf wartet auf Entscheidung des Inhabers.", dry)
         return
     if rec.get("state", "offen") == "offen" and not dry:
         # Astra R5 P1: Warteschlange — entdeckt, noch nicht abgeschlossen; KEINE Hash-Reservierung,
@@ -925,7 +933,7 @@ def dispatch(st, net, net_name, iss, action, dry):
         close_with_notice(st, num, f"Zugang besteht: @{login} ist read-only auf {WARE}.", dry)
         return
     if state == "abgelehnt":
-        close_with_notice(st, num, "Zahlung bereits abgelehnt. Kein Zugang.", dry)
+        close_with_notice(st, num, abgelehnt_text(rec), dry)
         return
     if state == "widerruf-offen":
         revoke(st, num, login, rec.get("tx") or "", "Widerruf wird abgeschlossen.", dry)
@@ -992,7 +1000,7 @@ def bereinigen(st, open_nums):
     grenze = time.strftime("%Y-%m-%d", time.gmtime(time.time() - INVITES_BEHALTEN_TAGE * 86_400))
     vorher = len(st["invites"])
     st["invites"] = [i for i in st["invites"] if str(i.get("day", "")) >= grenze]
-    eph_weg = [k for k, v in st.get("ephemer", {}).items() if v.get("kommentar") == "ersetzt" or (v.get("kommentar") == "geschlossen" and k not in open_nums)]
+    eph_weg = [k for k, v in st.get("ephemer", {}).items() if v.get("kommentar") == "ersetzt" or (v.get("kommentar") in ("geschlossen", "kommentiert") and k not in open_nums)]
     for key in eph_weg:
         del st["ephemer"][key]
     return {"invites": vorher - len(st["invites"]), "ephemer": len(eph_weg)}
@@ -1069,6 +1077,14 @@ def main():
         st = load_state()
         if args.gate_erledigt is not None:  # K2 R3 P2: Inhaber-Entscheid zur Frist-Ablehnung, kein regulärer Lauf
             rec = st["issues"].get(str(args.gate_erledigt)) or {}
+            if rec.get("state") == "widerruf-offen":  # K2 R9 P3-5: Inhaber-Ausgang für den Widerruf; Zugang regelt der Inhaber von Hand
+                rec.update({"state": "abgelehnt", "grund": "widerruf", "erledigt": {"at": int(time.time()), "befund": args.befund}})
+                if rec.get("tx"):
+                    bind_hash(st, rec["tx"], args.gate_erledigt, rec.get("login") or "", "abgelehnt")
+                if not args.dry_run:
+                    save_state(st, False)
+                log(f"#{args.gate_erledigt} Widerruf vom Inhaber entschieden: Befund {args.befund} (Zugang von Hand geregelt, Hash bleibt gebunden, dry={args.dry_run})")
+                return 0
             if rec.get("state") == "abgelehnt" and rec.get("grund") == "frist":
                 vorher = (rec.get("erledigt") or {}).get("befund")
                 rec["erledigt"] = {"at": int(time.time()), "befund": args.befund}  # K2 R4 P3: Zeitpunkt + Prüfergebnis; Zweitaufruf = Korrektur
@@ -1076,7 +1092,7 @@ def main():
                     save_state(st, False)
                 log(f"#{args.gate_erledigt} Frist-Ablehnung erledigt: Befund {args.befund}" + (f" (Korrektur, vorher {vorher})" if vorher else "") + f" (dry={args.dry_run})")
             else:
-                log(f"#{args.gate_erledigt} keine Frist-Ablehnung")
+                log(f"#{args.gate_erledigt} keine Frist-Ablehnung und kein offener Widerruf")
             return 0
         if args.kommentar_freigeben is not None:  # Astra R7 P2: Inhaber-Entscheid, kein regulärer Lauf
             key = str(args.kommentar_freigeben)

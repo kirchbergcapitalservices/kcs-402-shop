@@ -195,6 +195,10 @@ def load_state():
             item["paid_units"] = val["paid_units"]
         if isinstance(val.get("seit"), int) and val["seit"] >= 0:  # Zeitpunkt von gesehen/eingeladen (K2 Bestand-P2)
             item["seit"] = val["seit"]
+        if val.get("grund") == "frist":  # K2 R3 P2: Frist-Ablehnung bleibt Menschen-Gate, bis der Inhaber sie erledigt
+            item["grund"] = "frist"
+        if val.get("erledigt") is True:
+            item["erledigt"] = True
         st["issues"][key] = item
     for inv in raw_v:
         need(isinstance(inv, dict) and isinstance(inv.get("issue"), int), "invite")
@@ -663,13 +667,15 @@ def bind_hash(st, tx, num, login, state):
     st["used_hashes"][tx] = {"issue": num, "state": state, "login": login}
 
 
-def fail_issue(st, num, login, tx, comment, dry, consume):
-    """Endgültig ablehnen. Hash nur verbrauchen, wenn er diesem Issue schon gehörte."""
+def fail_issue(st, num, login, tx, comment, dry, consume, grund=None):
+    """Endgültig ablehnen. Hash nur verbrauchen, wenn er diesem Issue schon gehörte. grund="frist" = Menschen-Gate (K2 R3 P2)."""
     if dry:
         log(f"  [dry-run] lehne #{num} ab: {comment}")
         return
     rec = st["issues"].setdefault(str(num), {})
     rec.update({"state": "abgelehnt", "login": login or rec.get("login") or ""})
+    if grund:
+        rec["grund"] = grund
     if consume and tx:
         bind_hash(st, tx, num, rec["login"], "abgelehnt")
     save_state(st, False)
@@ -784,7 +790,7 @@ def handle_paid(st, net, net_name, iss, dry):
             seit = int(rec.get("seit", time.time())) if state == "gesehen" else int(time.time())
             if code == "not_found" and int(time.time()) - seit > GESEHEN_MAX_S:
                 # K2 Bestand-P2: nie gefundene Transaktion nicht ewig nachladen. Hash nicht verbrauchen (consume=False).
-                fail_issue(st, num, login, tx, f"Transaktion nach {GESEHEN_MAX_S // 86_400} Tagen nicht gefunden. Kein Zugang; bei Irrtum neues Issue mit gültigem Hash.", dry, False)
+                fail_issue(st, num, login, tx, f"Transaktion nach {GESEHEN_MAX_S // 86_400} Tagen nicht gefunden. Kein Zugang. Für ein neues Issue ist eine neue Zahlung nötig; eine bereits geleistete Zahlung klärt der Inhaber.", dry, False, grund="frist")
                 return
             log(f"#{num} wartet: {detail}")
             return
@@ -863,7 +869,8 @@ def offene_gates(st):
     """Vorgänge, die auf den Inhaber warten: widerruf-offen oder ein Kommentar im Zustand unklar (Review K2 P2)."""
     wartend = {"unklar", "post-gestartet"}  # Review Grok R4: post-gestartet außerhalb des Fensters bleibt sonst stumm
     nums = {int(k) for k, v in st["issues"].items()
-            if v.get("state") == "widerruf-offen" or v.get("abschluss") in wartend or v.get("widerruf_kommentar") in wartend}
+            if v.get("state") == "widerruf-offen" or v.get("abschluss") in wartend or v.get("widerruf_kommentar") in wartend
+            or (v.get("state") == "abgelehnt" and v.get("grund") == "frist" and not v.get("erledigt"))}  # K2 R3 P2
     nums |= {int(k) for k, v in st.get("ephemer", {}).items() if v.get("kommentar") in wartend}
     return sorted(nums)
 
@@ -904,6 +911,8 @@ def main():
     ap.add_argument("--dry-run", action="store_true", help="nichts schreiben")
     ap.add_argument("--network", default=os.environ.get("KCS402_NETWORK", "sepolia"), choices=sorted(NET_ALIASES))
     ap.add_argument("--once-issue", type=int, default=None)
+    ap.add_argument("--gate-erledigt", type=int, default=None, metavar="ISSUE",
+                    help="Menschen-Gate (K2 R3 P2): Frist-Ablehnung nach Prüfung des Inhabers (Zahlung on-chain nachgesehen) als erledigt markieren; sonst kein Lauf")
     ap.add_argument("--kommentar-freigeben", type=int, default=None, metavar="ISSUE",
                     help="Menschen-Gate (Astra R7 P2): nach manueller Prüfung, dass kein Kommentar existiert, einen neuen Versuch erlauben; sonst kein Lauf")
     args = ap.parse_args()
@@ -911,6 +920,8 @@ def main():
         ap.error("--once-issue außerhalb 1..99999999")
     if args.kommentar_freigeben is not None and not 1 <= args.kommentar_freigeben <= 99_999_999:
         ap.error("--kommentar-freigeben außerhalb 1..99999999")
+    if args.gate_erledigt is not None and not 1 <= args.gate_erledigt <= 99_999_999:
+        ap.error("--gate-erledigt außerhalb 1..99999999")
     args.network = NET_ALIASES[args.network.lower()]
     net = NETS[args.network]
     need(net[0].startswith("https://") and ADDR.fullmatch(net[1]) and isinstance(net[2], int) and net[2] > 0, "netz")
@@ -922,6 +933,16 @@ def main():
         return 0
     try:
         st = load_state()
+        if args.gate_erledigt is not None:  # K2 R3 P2: Inhaber-Entscheid zur Frist-Ablehnung, kein regulärer Lauf
+            rec = st["issues"].get(str(args.gate_erledigt)) or {}
+            if rec.get("state") == "abgelehnt" and rec.get("grund") == "frist" and not rec.get("erledigt"):
+                rec["erledigt"] = True
+                if not args.dry_run:
+                    save_state(st, False)
+                log(f"#{args.gate_erledigt} Frist-Ablehnung als erledigt markiert (dry={args.dry_run})")
+            else:
+                log(f"#{args.gate_erledigt} keine offene Frist-Ablehnung")
+            return 0
         if args.kommentar_freigeben is not None:  # Astra R7 P2: Inhaber-Entscheid, kein regulärer Lauf
             key = str(args.kommentar_freigeben)
             rec, eph = st["issues"].get(key) or {}, st.get("ephemer", {}).get(key) or {}
@@ -965,7 +986,7 @@ def main():
             save_state(st, False)
         gates = offene_gates(st)  # Review K2 P2: ein hängender Vorgang darf im Cron nicht stumm bleiben
         if gates:
-            text = f"MENSCHEN-GATE offen: {len(gates)} Vorgang/Vorgänge, Issues {', '.join('#' + str(n) for n in gates)} (widerruf-offen oder Kommentar unklar) — Entscheid des Inhabers nötig"
+            text = f"MENSCHEN-GATE offen: {len(gates)} Vorgang/Vorgänge, Issues {', '.join('#' + str(n) for n in gates)} (widerruf-offen, Kommentar unklar oder Frist-Ablehnung) — Entscheid des Inhabers nötig"
             log(text)
             if not args.dry_run and signal_faellig(st, gates) and signal_mensch(text):
                 signal_merken(st, gates)

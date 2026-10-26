@@ -243,7 +243,12 @@ iss = {"number": 120, "created": 1.0, "login": "bob", "kind": "paid", "tx": "0x"
 m.handle_paid(st, net, "sepolia", iss, False)
 check("S29 erster Kontakt: gesehen mit seit, wartet", st["issues"]["120"]["state"]=="gesehen" and st["issues"]["120"]["seit"]>0 and not g.posts())
 st["issues"]["120"]["seit"] = int(_t.time()) - m.GESEHEN_MAX_S - 1; m.handle_paid(st, net, "sepolia", iss, False)
-check("S29b nach Frist: abgelehnt, Kommentar, Hash nicht verbraucht", st["issues"]["120"]["state"]=="abgelehnt" and len(g.posts())==1 and "0x"+"ff"*32 not in st["used_hashes"])
+check("S29b nach Frist: abgelehnt mit Grund frist, Kommentar, Hash nicht verbraucht", st["issues"]["120"]["state"]=="abgelehnt" and st["issues"]["120"].get("grund")=="frist" and len(g.posts())==1 and "0x"+"ff"*32 not in st["used_hashes"] and "neue Zahlung" in g.comments[120][0]["body"])
+check("S29b2 Frist-Ablehnung ist offenes Gate", m.offene_gates(st)==[120])
+m.save_state(st, False); sys.argv=["kcs402_check.py","--gate-erledigt","120"]; rc=m.main(); st=m.load_state()
+check("S29b3 --gate-erledigt schließt das Gate, Zustand bleibt abgelehnt/frist", rc==0 and st["issues"]["120"].get("erledigt") is True and st["issues"]["120"]["grund"]=="frist" and m.offene_gates(st)==[])
+sys.argv=["kcs402_check.py","--gate-erledigt","999"]; rc=m.main(); check("S29b4 --gate-erledigt ohne Frist-Fall: nichts, rc 0", rc==0)
+st["issues"]["122"]={"state":"abgelehnt","login":"bob","tx":""}; check("S29b5 gewöhnliche Ablehnung ist kein Gate", m.offene_gates(st)==[])
 g = FakeGH(); m.gh = g; st = m.empty_state(); st["issues"]["121"]={"state":"gesehen","login":"bob","tx":"0x"+"ab"*32,"seit": int(_t.time()) - m.GESEHEN_MAX_S - 1}
 m.verify_payment = lambda net, tx, num, created: ("pending", "low_conf", "nur 2 Bestätigungen", 0)
 m.handle_paid(st, net, "sepolia", {"number":121,"created":1.0,"login":"bob","kind":"paid","tx":"0x"+"ab"*32,"closed":False}, False)

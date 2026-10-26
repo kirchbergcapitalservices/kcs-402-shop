@@ -699,7 +699,8 @@ def fail_issue(st, num, login, tx, comment, dry, consume, grund=None):
     close_with_notice(st, num, comment, False)
 
 
-def revoke(st, num, login, tx, reason, dry):
+def revoke(st, num, login, tx, reason, dry, text=None):
+    """text: Kommentar an den Käufer; Standard ist der Reorg-Fall. Für Reservierungs-/Rekonstruktionsfälle ohne Zweitzahlungs-Anreiz (Grok R13 P2)."""
     rec = st["issues"].setdefault(str(num), {})
     rec.update({"state": "widerruf-offen", "login": login or rec.get("login") or "", "tx": tx or rec.get("tx") or ""})
     tx = rec["tx"]
@@ -714,12 +715,19 @@ def revoke(st, num, login, tx, reason, dry):
     # entschieden; das Issue bleibt offen, der Hash bleibt gebunden.
     log(f"#{num} P1 WIDERRUF-OFFEN: {reason} — manuell prüfen (we_added={rec.get('we_added')}, login={rec['login']})")
     if rec.get("widerruf_kommentar") not in ("kommentiert", "geschlossen") and still_open(num):
-        comment_once(st, num, "widerruf", f"Zahlung nach Einladung nicht mehr gültig ({str(reason)[:200]}). Wird manuell geprüft.")  # Astra R7 P2
+        comment_once(st, num, "widerruf", text or f"Zahlung nach Einladung nicht mehr gültig ({str(reason)[:200]}). Wird manuell geprüft.")  # Astra R7 P2
 
 
 def grant(st, net_name, iss, tx, paid, dry):
     num, login = iss["number"], iss["login"]
     rec = st["issues"].setdefault(str(num), {})
+    if rec.get("state") != "geprüft" or "invite_started" not in rec or "paid_units" not in rec:
+        # Grok R13 (dritte Wand): grant() nur aus einer echten Reservierung dieses Prüfers (setzt invite_started + paid_units im selben
+        # Save). Alles andere — Altbestand, Handarbeit, Absturzreste — ist Menschen-Gate, nie ein PUT.
+        log(f"#{num} grant() ohne echte Reservierung (state={rec.get('state')}) — kein PUT, Menschen-Gate")
+        revoke(st, num, login, tx, "Einladung ohne Reservierungsdaten angefordert; der Inhaber prüft.", dry,
+               text="Dieser Vorgang wird vom Inhaber geprüft. Bitte keine zweite Zahlung senden.")
+        return
     if dry:
         log(f"  [dry-run] würde @{login} read-only in {WARE} einladen ({usdc(paid)} USDC)")
         return
@@ -782,28 +790,34 @@ def handle_paid(st, net, net_name, iss, dry):
         fail_issue(st, num, login, tx, f"Transaktion bereits für Issue #{owner['issue']} verbraucht.", dry, False)
         return
     if owner and owner["issue"] == num and rec.get("state", "offen") == "offen" and owner["state"] != "offen":
-        rec = st["issues"].setdefault(str(num), {})
-        rec.update({"state": owner["state"], "tx": tx, "login": login})
-        if not dry:
-            save_state(st, False)
-        # Sicherheits-Review 26.10. (HIGH, Tiefenverteidigung): ein aus used_hashes rekonstruierter Vorgang darf nie wieder in
-        # grant()/PUT laufen — "eingeladen" geht in die Reorg-Wache (Abschluss nur über Marker), alles andere Entschiedene endet hier.
-        if rec["state"] == "eingeladen":
+        # Sicherheits-Review 26.10. (HIGH) + Grok R13 (P1 Absturzfenster): ein aus used_hashes rekonstruierter Vorgang darf nie in
+        # grant()/PUT laufen, und zwischen Rekonstruktion und Abzweig darf KEIN Zwischenzustand gespeichert werden — sonst läge nach
+        # einem Absturz eine "geprüft"-Reservierung ohne Reservierungsfelder, die der nächste Lauf einladen würde.
+        rlogin = owner.get("login") or login  # Login aus der Bindung, nicht vom aktuellen Issue-Autor überschreiben
+        if owner["state"] == "eingeladen":
+            rec = st["issues"].setdefault(str(num), {})
+            rec.update({"state": "eingeladen", "tx": tx, "login": rlogin})
+            if not dry:
+                save_state(st, False)
             log(f"#{num} Vorgang aus used_hashes rekonstruiert (eingeladen) — kein erneuter PUT, Reorg-Wache")
             reorg_watch(st, net, iss, rec, dry)
             return
-        if rec["state"] == "abgelehnt":
+        if owner["state"] == "abgelehnt":
+            rec = st["issues"].setdefault(str(num), {})
+            rec.update({"state": "abgelehnt", "tx": tx, "login": rlogin})
+            if not dry:
+                save_state(st, False)
             log(f"#{num} Vorgang aus used_hashes rekonstruiert (abgelehnt) — keine Zahlungsprüfung, Entscheid bleibt")
             close_with_notice(st, num, "Zahlung bereits abgelehnt. Kein Zugang.", dry)
             return
-        if rec["state"] == "widerruf-offen":
-            log(f"#{num} Vorgang aus used_hashes rekonstruiert (widerruf-offen) — Menschen-Gate bleibt")
-            revoke(st, num, login, tx, "Widerruf wartet auf Entscheidung des Inhabers.", dry)
-            return
-        if rec["state"] == "geprüft":  # Grok R11: Reservierung ohne invite_started/pre_existing — ob der PUT lief, ist unbekannt
-            log(f"#{num} Vorgang aus used_hashes rekonstruiert (geprüft, Vorgangsdaten fehlen) — kein PUT, Inhaber prüft den Zugang")
-            revoke(st, num, login, tx, "Reservierung ohne Vorgangsdaten rekonstruiert; Zugang wird vom Inhaber geprüft.", dry)
-            return
+        # widerruf-offen, geprüft (Reservierung ohne Vorgangsdaten) und jeder unbekannte Zustand: Menschen-Gate; revoke() schreibt
+        # den Zielzustand widerruf-offen in EINEM Save — kein Zwischenstand "geprüft" auf der Platte.
+        grund = {"widerruf-offen": "Widerruf wartet auf Entscheidung des Inhabers.",
+                 "geprüft": "Reservierung ohne Vorgangsdaten rekonstruiert; der Inhaber prüft Zahlung und Zugang."}.get(
+            owner["state"], f"Vorgang mit unbekanntem Hash-Zustand {owner['state']} rekonstruiert; der Inhaber prüft.")
+        log(f"#{num} Vorgang aus used_hashes rekonstruiert ({owner['state']}) — kein PUT, Menschen-Gate")
+        revoke(st, num, rlogin, tx, grund, dry, text="Dieser Vorgang wird vom Inhaber geprüft. Bitte keine zweite Zahlung senden.")
+        return
     if not login or not LOGIN_RE.fullmatch(login):
         log(f"#{num} Login fehlt, bleibt offen")
         return
@@ -874,7 +888,8 @@ def handle_paid(st, net, net_name, iss, dry):
             # Grok R12 P2: eine Reservierung darf nicht ewig schweben (belegt einen Tagesplatz ohne Gate) → Menschen-Gate,
             # Hash bleibt gebunden, kein PUT, kein DELETE; der Inhaber entscheidet.
             log(f"#{num} Reservierung seit > {GESEHEN_MAX_S // 86_400} Tagen schwebend ({code}) — Menschen-Gate")
-            revoke(st, num, login, tx, f"Reservierung nach {GESEHEN_MAX_S // 86_400} Tagen nicht bestätigt ({code}).", dry)
+            revoke(st, num, login, tx, f"Reservierung nach {GESEHEN_MAX_S // 86_400} Tagen nicht bestätigt ({code}).", dry,
+                   text="Die Zahlung konnte innerhalb von 7 Tagen nicht bestätigt werden. Der Inhaber prüft den Vorgang; bitte keine zweite Zahlung senden.")
             return
         log(f"#{num} reserviert, wartet: {detail}")
         return

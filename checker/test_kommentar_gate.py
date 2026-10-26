@@ -453,6 +453,21 @@ def vp(net, tx, num, created):
 m.verify_payment = vp; m.handle_paid(st, net, "sepolia", {"number":652,"created":1.0,"login":"bob","kind":"paid","tx":TX(652),"closed":False}, False)
 check("S41c Reservierung bekommt seit, zweite Prüfung pending → wartet", st["issues"]["652"]["state"]=="geprüft" and st["issues"]["652"].get("seit",0)>0 and not g.puts)
 
+# S39h Grok R13 P1 (Absturzfenster): gespeicherte geprüft-Reservierung OHNE Reservierungsfelder, Zahlung ok → kein PUT, Menschen-Gate
+g = FakeGH2(); m.gh = g; st = m.empty_state(); g.add(660, "paid:"+TX(660))
+st["issues"]["660"]={"state":"geprüft","login":"bob","tx":TX(660)}; m.bind_hash(st, TX(660), 660, "bob", "geprüft"); m.save_state(st, False)
+m.verify_payment = lambda net, tx, num, created: ("ok","ok","ok",100660); sys.argv=["kcs402_check.py","--network","sepolia"]; sig=[]; m.signal_mensch = lambda t: (sig.append(t), True)[1]
+rc=m.main(); st3=m.load_state()
+check("S39h geprüft ohne Reservierungsfelder: kein PUT, widerruf-offen, rc 2, Kommentar ohne Zweitzahlungs-Anreiz", not g.puts and st3["issues"]["660"]["state"]=="widerruf-offen" and rc==2 and any("keine zweite Zahlung" in c["body"] for c in g.comments.get(660, [])), str(g.puts))
+# S39i Rekonstruktion geprüft speichert keinen Zwischenstand: nach dem Lauf steht widerruf-offen, nie geprüft; Login aus der Bindung
+st = m.empty_state(); m.bind_hash(st, TX(661), 661, "alice", "geprüft"); m.save_state(st, False)
+g = FakeGH2(); m.gh = g; g.add(661, "paid:"+TX(661), login="bob"); m.verify_payment = lambda net, tx, num, created: ("ok","ok","ok",100661); rc=m.main(); st3=m.load_state()
+check("S39i rekonstruiertes geprüft → direkt widerruf-offen, Login aus Bindung (alice), kein PUT", not g.puts and st3["issues"]["661"]["state"]=="widerruf-offen" and st3["issues"]["661"]["login"]=="alice")
+# S39j unbekannter Hash-Zustand (gesehen in used_hashes) → Gate, kein PUT
+st = m.empty_state(); st["used_hashes"][TX(662)]={"issue":662,"state":"gesehen","login":"bob"}; m.save_state(st, False)
+g = FakeGH2(); m.gh = g; g.add(662, "paid:"+TX(662)); rc=m.main(); st3=m.load_state()
+check("S39j unbekannter Hash-Zustand → widerruf-offen, kein PUT", not g.puts and st3["issues"]["662"]["state"]=="widerruf-offen")
+
 # S40 Größenwarnung: rc 3 + ein Signal je 24 h; kein Signal im Trockenlauf
 g = FakeGH2(); m.gh = g; st = m.empty_state(); m.save_state(st, False); alt_warn = m.STATE_WARN_BYTES; m.STATE_WARN_BYTES = 10
 sig=[]; m.signal_mensch = lambda t: (sig.append(t), True)[1]; sys.argv=["kcs402_check.py","--network","sepolia"]; rc1=m.main(); rc2=m.main()
